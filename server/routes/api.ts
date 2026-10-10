@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { randomBytes, createCipheriv, createDecipheriv } from 'node:crypto';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
-import type { Problem, SearchFilters, Settings, Submission } from '../../shared/types.js';
+import type { SearchFilters, Settings, Submission, SyncStatus } from '../../shared/types.js';
 import { fetchCatalog, fetchFullHistory, fetchProfile, fetchRatings, fetchRecent, fetchVotes } from '../adapters/leetcode.js';
 import { buildModel, recommend } from '../engine/capabilityEngine.js';
 import { db, getKV, getProblems, getProfile, getSettings, getSubmissions, saveProblems, saveSubmissions, setKV } from '../db/index.js';
@@ -15,39 +15,48 @@ function sessionKey() { mkdirSync(dirname(secretPath), { recursive: true }); if 
 function encrypt(value: string) { const iv = randomBytes(12); const cipher = createCipheriv('aes-256-gcm', sessionKey(), iv); const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]); return Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString('base64'); }
 function decrypt(value: string) { const raw = Buffer.from(value, 'base64'); const decipher = createDecipheriv('aes-256-gcm', sessionKey(), raw.subarray(0, 12)); decipher.setAuthTag(raw.subarray(12, 28)); return Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString('utf8'); }
 function getSession() { const encrypted = getKV<string>('encryptedSession', ''); return process.env.LEETCODE_SESSION || (encrypted ? decrypt(encrypted) : ''); }
-async function sync() {
-  const username = getSettings().username.trim();
+let syncPromise: Promise<{ newSolves: number; error: string }> | undefined;
+let activeUsername = '';
+export function getSyncStatus(): SyncStatus { return { running: !!syncPromise, lastSync: getKV<number | undefined>('lastSyncAt', undefined), lastError: getKV<string>('lastSyncError', ''), newSolves: getKV<number>('lastSyncNewSolves', 0) }; }
+async function syncOnce(username: string) {
   if (!username) return { newSolves: 0, error: '' };
   try {
     const profile = await fetchProfile(username);
+    if (getSettings().username !== username) return { newSolves: 0, error: 'Profile changed during sync' };
     setKV('profile', profile);
     let incoming = await fetchRecent(username);
     const session = getSession();
-    if (session) { try { incoming = await fetchFullHistory(session, new Set(getSubmissions().filter(s => s.source === 'session').map(s => s.id))); db.prepare("DELETE FROM submissions WHERE source='public'").run(); } catch (error) { setKV('sessionError', errorText(error)); } }
+    let sessionError = '';
+    if (session) { try { incoming = await fetchFullHistory(session, new Set(getSubmissions().filter(s => s.source === 'session').map(s => s.id))); db.prepare("DELETE FROM submissions WHERE source='public'").run(); } catch (error) { sessionError = `Full history unavailable: ${errorText(error)}`; } }
+    if (getSettings().username !== username) return { newSolves: 0, error: 'Profile changed during sync' };
     const before = new Set(getSubmissions().filter(s => s.status === 'accepted').map(s => s.slug));
     saveSubmissions(incoming);
     const after = new Set(getSubmissions().filter(s => s.status === 'accepted').map(s => s.slug));
-    setKV('lastSyncError', '');
-    return { newSolves: after.size - before.size, error: '' };
+    const newSolves = after.size - before.size;
+    setKV('lastSyncAt', Date.now()); setKV('lastSyncNewSolves', newSolves); setKV('lastSyncError', sessionError);
+    return { newSolves, error: sessionError };
   } catch (error) { const message = errorText(error); setKV('lastSyncError', message); return { newSolves: 0, error: message }; }
 }
+export function syncLeetCode(): Promise<{ newSolves: number; error: string }> { const username = getSettings().username.trim(); if (syncPromise) return activeUsername === username ? syncPromise : syncPromise.then(() => syncLeetCode()); activeUsername = username; syncPromise = syncOnce(username).finally(() => { syncPromise = undefined; activeUsername = ''; }); return syncPromise; }
 function currentModel() { return buildModel(getProblems(), getSubmissions(), getProfile(), getSettings()); }
 
 api.get('/bootstrap', (_req, res) => {
   const problems = getProblems();
-  res.json({ settings: getSettings(), profile: getProfile(), model: currentModel(), catalogCount: problems.length, tags: [...new Set(problems.flatMap(p => p.tags))].sort(), companies: [...new Set(problems.flatMap(p => p.companyTags ?? []))].sort(), catalogJob, lists: db.prepare('SELECT * FROM lists ORDER BY name').all(), syncError: getKV('lastSyncError', '') });
+  res.json({ settings: getSettings(), profile: getProfile(), model: currentModel(), catalogCount: problems.length, tags: [...new Set(problems.flatMap(p => p.tags))].sort(), companies: [...new Set(problems.flatMap(p => p.companyTags ?? []))].sort(), catalogJob, lists: db.prepare('SELECT * FROM lists ORDER BY name').all(), syncStatus: getSyncStatus() });
 });
-api.post('/search', async (req, res) => {
+function searchFromCache(filters: SearchFilters, newSolves = 0, syncError = '') {
   const before = getKV<ReturnType<typeof currentModel>>('lastModel', currentModel());
-  const result = await sync();
   const problems = getProblems(), submissions = getSubmissions(), profile = getProfile(), settings = getSettings();
   const model = buildModel(problems, submissions, profile, settings);
   db.transaction(() => { db.prepare('DELETE FROM ratings').run(); const stmt = db.prepare('INSERT INTO ratings VALUES(?,?,?,?,?,?,?)'); for (const s of model.skills) stmt.run(s.tag, s.rating, s.confidence, s.attempts, s.failures, +s.weak, model.updatedAt); })();
   const changes = model.skills.map(s => ({ tag: s.tag, before: before.skills.find(x => x.tag === s.tag)?.rating ?? before.overall, after: s.rating })).filter(x => x.before !== x.after).sort((a, b) => Math.abs(b.after - b.before) - Math.abs(a.after - a.before)).slice(0, 3);
   setKV('lastModel', model);
-  res.json({ recommendations: recommend(problems, submissions, model, settings, req.body as SearchFilters), model, profile, delta: { newSolves: result.newSolves, changes }, catalogCount: problems.length, syncError: result.error });
-});
-api.post('/sync', async (_req, res) => res.json(await sync()));
+  return { recommendations: recommend(problems, submissions, model, settings, filters), model, profile, delta: { newSolves, changes }, catalogCount: problems.length, syncError, syncStatus: getSyncStatus() };
+}
+api.post('/search/cached', (req, res) => res.json(searchFromCache(req.body as SearchFilters)));
+api.post('/search', async (req, res) => { const result = await syncLeetCode(); res.json(searchFromCache(req.body as SearchFilters, result.newSolves, result.error)); });
+api.post('/sync', async (_req, res) => res.json({ ...(await syncLeetCode()), syncStatus: getSyncStatus() }));
+api.get('/sync/status', (_req, res) => res.json(getSyncStatus()));
 api.post('/catalog/refresh', (_req, res) => {
   if (catalogJob.running) { res.json(catalogJob); return; }
   catalogJob = { running: true, loaded: 0, total: 0, phase: 'catalog', error: '' };
@@ -70,14 +79,25 @@ api.put('/settings', (req, res) => {
   const prior = getSettings(); const body = req.body as Partial<Settings>;
   const clean: Settings = { ...prior, username: typeof body.username === 'string' ? body.username.trim().slice(0, 80) : prior.username, useContestRatings: typeof body.useContestRatings === 'boolean' ? body.useContestRatings : prior.useContestRatings, halfLifeDays: Number.isFinite(body.halfLifeDays) ? Math.max(7, Math.min(365, Number(body.halfLifeDays))) : prior.halfLifeDays, planSize: Number.isFinite(body.planSize) ? Math.max(1, Math.min(12, Number(body.planSize))) : prior.planSize, weights: { ...prior.weights }, hasSession: prior.hasSession };
   for (const key of Object.keys(prior.weights) as (keyof Settings['weights'])[]) if (Number.isFinite(body.weights?.[key])) clean.weights[key] = Math.max(0, Math.min(8, Number(body.weights![key])));
+  const changedAccount = clean.username !== prior.username;
+  if (changedAccount && prior.username) setKV(`account:${prior.username}`, { profile: getProfile(), submissions: getSubmissions(), lastSyncAt: getKV<number | undefined>('lastSyncAt', undefined), lastSyncError: getKV<string>('lastSyncError', '') });
   setKV('settings', { ...clean, hasSession: undefined });
-  if (clean.username !== prior.username) setKV('profile', { username: clean.username, solved: { Easy: 0, Medium: 0, Hard: 0 }, tagStats: {} });
+  if (changedAccount) {
+    const saved = getKV<{ profile: ReturnType<typeof getProfile>; submissions: Submission[]; lastSyncAt?: number; lastSyncError?: string } | null>(`account:${clean.username}`, null);
+    if (prior.username || saved) db.prepare('DELETE FROM submissions').run();
+    db.prepare('DELETE FROM ratings').run();
+    db.prepare("DELETE FROM kv WHERE key IN ('lastModel','lastSyncAt','lastSyncError','lastSyncNewSolves')").run();
+    if (saved) { saveSubmissions(saved.submissions); setKV('profile', saved.profile); if (saved.lastSyncAt) setKV('lastSyncAt', saved.lastSyncAt); if (saved.lastSyncError) setKV('lastSyncError', saved.lastSyncError); }
+    else setKV('profile', { username: clean.username, solved: { Easy: 0, Medium: 0, Hard: 0 }, tagStats: {} });
+    if (clean.username) void syncLeetCode();
+  }
   res.json(getSettings());
 });
 api.post('/session', (req, res) => {
   const value = String(req.body.session ?? '').trim();
   if (value && !/^[A-Za-z0-9_\-.%]+$/.test(value)) { res.status(400).json({ error: 'Invalid cookie format' }); return; }
   setKV('encryptedSession', value ? encrypt(value) : '');
+  if (value && getSettings().username) void syncLeetCode();
   res.json({ hasSession: !!value || !!process.env.LEETCODE_SESSION });
 });
 api.post('/feedback', (req, res) => {

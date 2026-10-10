@@ -21,7 +21,7 @@ SQLite tables: `problems` caches catalog metadata and optional contest ratings; 
 2. Run `npm install`.
 3. Copy `.env.example` to `.env`. You may leave `LEETCODE_SESSION` blank. If you set it, keep `.env` private.
 4. Run `npm run dev` and open [http://localhost:5173](http://localhost:5173).
-5. In Settings, enter your LeetCode username and save. Click **Refresh catalog**. The first refresh may take several minutes because catalog pages and vote-count batches are throttled. Search or click **Recommend for me** to sync and recompute.
+5. In Settings, enter your LeetCode username and save. Click **Refresh catalog**. The first refresh may take several minutes because catalog pages and vote-count batches are throttled. RickyLeet saves your profile and submissions in SQLite, checks LeetCode in the background on server start, and checks again on each search. Cached recommendations appear immediately while a search sync runs. Use **Refresh from LeetCode** at any time to force a sync; the UI shows the last successful sync time and errors.
 6. If LeetCode is unavailable, run `npm run seed` for a small sample catalog and import solved slugs from JSON or CSV.
 
 `npm run build` checks both TypeScript projects and builds the web app. `npm test` runs the capability engine tests. The backend listens only on `127.0.0.1:3001`; Vite proxies `/api` to it.
@@ -31,7 +31,7 @@ SQLite tables: `problems` caches catalog metadata and optional contest ratings; 
 1. Initialize overall skill from contest rating plus solved counts. Initialize each topic from the overall baseline and public tag-wise counts.
 2. Replay local submission events in timestamp order. For each event, use `expected = 1 / (1 + 10^((problemRating - skillRating) / 400))`, then `rating += K × (outcome - expected)`. First-try accepted is 1; later accepted is 0.5–0.7; accepted with hints or over two hours is 0.4; failed or abandoned is 0. Old events have `K` multiplied by `2^(-ageDays / halfLifeDays)`.
 3. Confidence rises with weighted evidence. A topic is weak when its rating is 90+ below overall or its recorded failure rate exceeds 45% after at least three attempts.
-4. Every search syncs available submissions, rebuilds the model, and scores cached problems. Stretch fit peaks at 65% predicted solve chance. Weakness, uncertainty, quality, diversity, and recent topic fatigue are weighted by Settings sliders. Solved problems return for review on a 1, 3, 7, 21, 60 day cadence when they were difficult or the topic is weak.
+4. Every search starts with saved recommendations, syncs available submissions, rebuilds the model, and scores cached problems again. Concurrent startup, search, and manual refresh triggers share one sync request. Stretch fit peaks at 65% predicted solve chance. Weakness, uncertainty, quality, diversity, and recent topic fatigue are weighted by Settings sliders. Solved problems return for review on a 1, 3, 7, 21, 60 day cadence when they were difficult or the topic is weak.
 
 Tune the weight sliders to emphasize stretch practice, weak topics, exploration, quality, diversity, or freshness. **Interview Prep**, **Contest Training**, **Weak Spot Fixer**, and **Easy Warm-up** apply presets. The half-life slider changes how fast old practice loses influence.
 
