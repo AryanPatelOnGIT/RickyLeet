@@ -1,0 +1,11 @@
+export type Difficulty = 'Easy' | 'Medium' | 'Hard';
+export type Problem = { id: string; title: string; slug: string; difficulty: Difficulty; acceptance: number; tags: string[]; paid: boolean; likes: number; dislikes: number; rating?: number; companyTags?: string[]; createdAt?: string };
+export type Submission = { id: string; slug: string; timestamp: number; status: 'accepted' | 'failed' | 'attempted'; attempts: number; runtime?: string; source: 'public' | 'session' | 'import' | 'feedback'; hints?: boolean; minutes?: number };
+export type Skill = { tag: string; rating: number; confidence: number; attempts: number; failures: number; weak: boolean };
+export type Weights = { targetFit: number; weakness: number; exploration: number; quality: number; diversity: number; fatigue: number };
+export type Settings = { username: string; useContestRatings: boolean; halfLifeDays: number; weights: Weights; planSize: number; hasSession: boolean };
+export type Profile = { username: string; ranking?: number; contestRating?: number; solved: { Easy: number; Medium: number; Hard: number }; tagStats: Record<string, number>; lastSync?: number; syncError?: string };
+export type Recommendation = { problem: Problem; score: number; probability: number; estimatedMinutes: number; reason: string; review: boolean; status: 'unsolved' | 'solved' | 'attempted' | 'skipped'; group?: string };
+export type Model = { overall: number; skills: Skill[]; history: { date: string; rating: number }[]; activity: { date: string; count: number }[]; weakTags: string[]; strongTags: string[]; updatedAt: number };
+export type SearchFilters = { query?: string; difficulties?: Difficulty[]; tags?: string[]; companies?: string[]; minProbability?: number; maxProbability?: number; minAcceptance?: number; maxAcceptance?: number; access?: 'all' | 'free' | 'paid'; status?: 'all' | 'unsolved' | 'solved' | 'attempted' | 'never-seen'; sort?: 'best' | 'difficulty' | 'acceptance' | 'likes' | 'newest'; groupBy?: 'none' | 'topic' | 'difficulty' | 'pattern' | 'skill' };
+export type SearchResponse = { recommendations: Recommendation[]; model: Model; profile: Profile; delta: { newSolves: number; changes: { tag: string; before: number; after: number }[] }; catalogCount: number; syncError?: string };
