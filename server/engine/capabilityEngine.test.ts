@@ -10,7 +10,7 @@ describe('capability engine', () => {
   it('prefers the stretch zone and sane quality', () => { expect(targetFit(0.65)).toBeGreaterThan(targetFit(0.2)); expect(qualityScore(problem)).toBeGreaterThan(0.7); });
   it('replays accepted and failed submissions chronologically', () => { const now = Date.now(); const failed: Submission = { id: 'f', slug: 'two-sum', timestamp: now - 2000, status: 'failed', attempts: 1, source: 'feedback' }; const accepted: Submission = { ...failed, id: 'a', timestamp: now - 1000, status: 'accepted' }; const base = buildModel([problem], [], profile, settings, now); const after = buildModel([problem], [failed, accepted], profile, settings, now); expect(after.skills.find(s => s.tag === 'Array')!.attempts).toBe(2); expect(after.overall).not.toBe(base.overall); });
   it('does not recommend recently solved problems', () => { const now = Date.now(); const s: Submission = { id: 'a', slug: 'two-sum', timestamp: now, status: 'accepted', attempts: 1, source: 'feedback' }; const model = buildModel([problem], [s], profile, settings, now); expect(recommend([problem], [s], model, settings, {}, now)).toHaveLength(0); });
-  it('advances review spacing after a completed review', () => { const now = Date.now(); const day = 86400000; const first: Submission = { id: 'a', slug: 'two-sum', timestamp: now - 5 * day, status: 'accepted', attempts: 2, source: 'feedback' }; const reviewed = { ...first, id: 'b', timestamp: now - 2 * day, attempts: 1 }; const model = buildModel([problem], [first, reviewed], profile, settings, now); expect(recommend([problem], [first, reviewed], model, settings, {}, now)).toHaveLength(0); expect(recommend([problem], [first, reviewed], model, settings, {}, now + day)).toHaveLength(1); });
+  it('never resurfaces verified solves in the primary feed', () => { const now = Date.now(); const day = 86400000; const first: Submission = { id: 'a', slug: 'two-sum', timestamp: now - 5 * day, status: 'accepted', attempts: 2, source: 'feedback' }; const reviewed = { ...first, id: 'b', timestamp: now - 2 * day, attempts: 1 }; const model = buildModel([problem], [first, reviewed], profile, settings, now); expect(recommend([problem], [first, reviewed], model, settings, {}, now)).toHaveLength(0); expect(recommend([problem], [first, reviewed], model, settings, {}, now + 90 * day)).toHaveLength(0); });
   it('follows demonstrated Easy Array history despite a high contest rating', () => {
     const now = Date.now(), day = 86400000;
     const catalog: Problem[] = [problem,
@@ -81,5 +81,46 @@ describe('capability engine', () => {
     const ranked = recommend(catalog, [], model, settings);
     expect(ranked[0].problem.difficulty).toBe('Easy');
     expect(ranked[0].probability).toBeGreaterThan(ranked.find(r => r.problem.difficulty === 'Medium')!.probability);
+  });
+  it('excludes duplicate catalog slugs with the same stable problem ID', () => {
+    const alias = { ...problem, slug: 'two-sum-legacy' };
+    const solved: Submission = { id: 'accepted', slug: problem.slug, timestamp: Date.now(), status: 'accepted', attempts: 1, source: 'public' };
+    const catalog = [problem, alias];
+    expect(recommend(catalog, [solved], buildModel(catalog, [solved], profile, settings), settings)).toHaveLength(0);
+  });
+  it('does not treat repeat accepts as distinct full-strength solves', () => {
+    const now = Date.now();
+    const first: Submission = { id: 'one', slug: problem.slug, timestamp: now - 1000, status: 'accepted', attempts: 1, source: 'session' };
+    const second = { ...first, id: 'two', timestamp: now };
+    const base = buildModel([problem], [], profile, settings, now).overall;
+    const once = buildModel([problem], [first], profile, settings, now).overall;
+    const twice = buildModel([problem], [first, second], profile, settings, now).overall;
+    expect(Math.abs(twice - once)).toBeLessThan(Math.abs(once - base));
+  });
+  it('keeps prior relevant recommendations after a small model change', () => {
+    const now = Date.now();
+    const catalog = [problem, { ...problem, id: '2', slug: 'array-2', title: 'Array 2' }, { ...problem, id: '3', slug: 'array-3', title: 'Array 3' }];
+    const base = buildModel(catalog, [], profile, settings, now);
+    const previous = new Map([['array-3', { shownAt: now - 86400000, position: 0 }]]);
+    const first = recommend(catalog, [], base, settings, {}, now, 3, { previous });
+    const nudged = { ...base, overall: base.overall + 5 };
+    const second = recommend(catalog, [], nudged, settings, {}, now, 3, { previous });
+    expect(first.map(r => r.problem.slug)).toEqual(second.map(r => r.problem.slug));
+  });
+  it('pauses skipped problems without losing other candidates', () => {
+    const now = Date.now(); const next = { ...problem, id: '2', slug: 'array-next' }; const catalog = [problem, next];
+    const model = buildModel(catalog, [], profile, settings, now);
+    expect(recommend(catalog, [], model, settings, {}, now, 10, { skipped: new Map([[problem.slug, now]]) }).map(r => r.problem.slug)).toEqual([next.slug]);
+    expect(recommend(catalog, [], model, settings, {}, now + 31 * 86400000, 10, { skipped: new Map([[problem.slug, now]]) })).toHaveLength(2);
+  });
+  it('limits weak-topic influence so familiar topics still lead', () => {
+    const now = Date.now();
+    const familiar = { ...problem, id: '2', slug: 'array-next', tags: ['Array', 'Hash Table'] };
+    const weak = { ...problem, id: '3', slug: 'graph-next', tags: ['Graph Theory'] };
+    const solved: Submission = { id: 'solved', slug: problem.slug, timestamp: now, status: 'accepted', attempts: 1, source: 'public' };
+    const catalog = [problem, familiar, weak];
+    const model = buildModel(catalog, [solved], { ...profile, solved: { Easy: 1, Medium: 0, Hard: 0 }, tagStats: { Array: 1 } }, settings, now);
+    model.skills.find(s => s.tag === 'Graph Theory')!.weak = true;
+    expect(recommend(catalog, [solved], model, settings, {}, now)[0].problem.slug).toBe(familiar.slug);
   });
 });

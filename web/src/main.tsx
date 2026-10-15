@@ -1,47 +1,112 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { BarChart3, Compass, Map, CalendarDays, Settings2, Search, RefreshCw, Sparkles, Menu, X, SlidersHorizontal } from 'lucide-react';
-import type { Difficulty, Recommendation, SearchFilters, SearchResponse, Settings } from '../../shared/types';
-import { api, bootstrap, getPlan, saveSettings, search, searchCached, type Bootstrap } from './api';
-import { Dashboard } from './pages/Dashboard';
-import { Roadmap } from './pages/Roadmap';
-import { SettingsPage } from './pages/Settings';
-import { ProblemCard } from './components/ProblemCard';
+import { ExternalLink, RefreshCw, Search, Settings2, X } from 'lucide-react';
+import type { Difficulty, SearchFilters, SearchResponse, Settings } from '../../shared/types';
+import { api, bootstrap, saveSettings, search, searchCached, type Bootstrap } from './api';
 import './style.css';
 
-type Page = 'dashboard' | 'recommend' | 'roadmap' | 'plan' | 'settings';
-const nav: { id: Page; label: string; icon: React.ComponentType<{ size?: number }> }[] = [{ id: 'dashboard', label: 'Dashboard', icon: BarChart3 }, { id: 'recommend', label: 'Recommendations', icon: Compass }, { id: 'roadmap', label: 'Roadmap', icon: Map }, { id: 'plan', label: "Today's plan", icon: CalendarDays }, { id: 'settings', label: 'Settings', icon: Settings2 }];
-function parseImport(content: string, name: string): string[] { if (name.endsWith('.json')) { const parsed = JSON.parse(content); const rows = Array.isArray(parsed) ? parsed : parsed.slugs ?? parsed.submissions ?? []; return rows.map((r: any) => typeof r === 'string' ? r : r.slug ?? r.titleSlug).filter(Boolean); } const lines = content.trim().split(/\r?\n/); const header = lines[0].split(',').map(s => s.trim().toLowerCase()); const col = Math.max(0, header.indexOf('slug')); return lines.slice(header.includes('slug') ? 1 : 0).map(line => line.split(',')[col]?.trim()).filter(Boolean); }
-function App() {
-  const [page, setPage] = useState<Page>('dashboard'); const [data, setData] = useState<Bootstrap | null>(null); const [results, setResults] = useState<SearchResponse | null>(null); const [plan, setPlan] = useState<Recommendation[]>([]); const [filters, setFilters] = useState<SearchFilters>({ sort: 'best', access: 'all', status: 'all', groupBy: 'none' }); const [loading, setLoading] = useState(false); const [notice, setNotice] = useState(''); const [menuOpen, setMenuOpen] = useState(false); const [filterOpen, setFilterOpen] = useState(false); const [catalogStatus, setCatalogStatus] = useState(''); const [busySlug, setBusySlug] = useState('');
-  const refreshBootstrap = useCallback(async () => { setData(await bootstrap()); }, []);
-  const runSearch = useCallback(async (next: SearchFilters, cached = false) => { if (!cached) setLoading(true); try { const response = await (cached ? searchCached(next) : search(next)); setResults(response); setData(current => current ? { ...current, model: response.model, profile: response.profile, catalogCount: response.catalogCount, syncStatus: response.syncStatus } : current); if (response.syncError) setNotice(`Offline cache used: ${response.syncError}`); } catch (error) { setNotice(String(error)); } finally { if (!cached) setLoading(false); } }, []);
-  useEffect(() => { void (async () => { try { await refreshBootstrap(); const initial: SearchFilters = { sort: 'best', access: 'all', status: 'all', groupBy: 'none' }; await runSearch(initial, true); await runSearch(initial); } catch (error) { setNotice(String(error)); } })(); }, [refreshBootstrap, runSearch]);
-  useEffect(() => { if (page === 'plan') void getPlan().then(setPlan).catch(e => setNotice(String(e))); }, [page, results]);
-  useEffect(() => { if (!data?.catalogJob.running) return; const id = setInterval(async () => { const job = await api<Bootstrap['catalogJob']>('/catalog/status'); setCatalogStatus(job.running ? job.phase === 'votes' ? `Catalog loaded; enriching vote counts…` : `Loading ${job.loaded} problems…` : job.error || `Catalog updated: ${job.loaded} problems`); if (!job.running) { clearInterval(id); await refreshBootstrap(); await runSearch(filters); } }, 2000); return () => clearInterval(id); }, [data?.catalogJob.running, refreshBootstrap, runSearch]);
-  const submitSearch = () => void runSearch(filters);
-  const refreshLeetCode = async () => { setLoading(true); try { const result = await api<{ newSolves: number; error: string; syncStatus: Bootstrap['syncStatus'] }>('/sync', 'POST'); setData(current => current ? { ...current, syncStatus: result.syncStatus } : current); await runSearch(filters, true); setResults(current => current ? { ...current, delta: { ...current.delta, newSolves: result.newSolves } } : current); setNotice(result.error ? `Cached data remains available: ${result.error}` : `LeetCode sync complete. ${result.newSolves} new solves saved.`); } catch (error) { setNotice(String(error)); } finally { setLoading(false); } };
-  const feedback = async (slug: string, action: string) => { setBusySlug(slug); try { await api('/feedback', 'POST', { slug, action }); setNotice(`Marked ${action.replace('-', ' ')}. Model will update on this search.`); await runSearch(filters); } catch (e) { setNotice(String(e)); } finally { setBusySlug(''); } };
-  const saveToList = async (slug: string) => { const name = window.prompt('Save to which list? Enter a new or existing list name:'); if (!name?.trim()) return; try { await api('/lists', 'POST', { name }); const fresh = await bootstrap(); setData(fresh); const list = fresh.lists.find(l => l.name === name.trim()); if (list) await api(`/lists/${list.id}/items`, 'POST', { slug }); setNotice(`Saved to ${name.trim()}.`); } catch (e) { setNotice(String(e)); } };
-  const refreshCatalog = async () => { try { const job = await api<Bootstrap['catalogJob']>('/catalog/refresh', 'POST'); setData(current => current ? { ...current, catalogJob: job } : current); setCatalogStatus('Catalog refresh started…'); } catch (e) { setNotice(String(e)); } };
-  const save = async (settings: Settings) => { try { const changedUsername = settings.username.trim() !== (data?.settings.username ?? ''); await saveSettings(settings); await refreshBootstrap(); await runSearch(filters, true); if (changedUsername) await runSearch(filters); setNotice('Settings saved and model updated.'); } catch (e) { setNotice(String(e)); } };
-  const setSession = async (session: string) => { try { const result = await api<{ hasSession: boolean }>('/session', 'POST', { session }); setData(current => current ? { ...current, settings: { ...current.settings, hasSession: result.hasSession } } : current); setNotice(result.hasSession ? 'Cookie stored locally in encrypted form.' : 'Cookie cleared.'); } catch (e) { setNotice(String(e)); } };
-  const importFile = async (file: File) => { try { const slugs = parseImport(await file.text(), file.name); const result = await api<{ imported: number; ignored: number }>('/import', 'POST', { slugs }); setNotice(`Imported ${result.imported} solves; ${result.ignored} ignored.`); await runSearch(filters); } catch (e) { setNotice(`Import failed: ${String(e)}`); } };
-  const reset = async () => { if (!window.confirm('Delete imported solves, synced submissions, feedback, and ratings?')) return; await api('/reset', 'POST'); await runSearch(filters); setNotice('Model history reset.'); };
-  if (!data) return <div className="startup"><span className="brand-mark">R</span><p>Loading RickyLeet…</p>{notice && <p>{notice}</p>}</div>;
-  const model = results?.model ?? data.model; const profile = results?.profile ?? data.profile; const recs = results?.recommendations ?? [];
-  return <div className="app-shell"><button className="mobile-menu icon-button" onClick={() => setMenuOpen(!menuOpen)} aria-label="Toggle navigation">{menuOpen ? <X/> : <Menu/>}</button><aside className={`sidebar ${menuOpen ? 'open' : ''}`}><div className="sidebar-label">WORKSPACE</div><nav>{nav.map(item => <button key={item.id} className={`nav-item ${page === item.id ? 'active' : ''}`} onClick={() => { setPage(item.id); setMenuOpen(false); }}><item.icon size={18}/>{item.label}</button>)}</nav><div className="sidebar-bottom"><div className="sync-card"><span className="sync-icon"><RefreshCw size={17}/></span><strong>LeetCode sync</strong><p>{data.syncStatus.running || loading ? 'Checking for new solves…' : data.syncStatus.lastSync ? `Last synced ${new Date(data.syncStatus.lastSync).toLocaleString()}` : 'No sync yet. Add a username in Settings.'}</p><button onClick={() => void refreshLeetCode()} disabled={loading || !data.settings.username}>{loading ? 'Syncing…' : 'Refresh from LeetCode →'}</button></div><div className="user-chip"><span>{profile.username?.[0]?.toUpperCase() || 'U'}</span><div><strong>{profile.username || 'Your profile'}</strong><small>{model.overall} estimated rating</small></div></div></div></aside>
-    <main className="main-area"><header className="topbar"><div className="breadcrumb">WORKSPACE <span>/</span> {nav.find(n => n.id === page)?.label.toUpperCase()}</div><div className="topbar-right"><button className="top-sync-button" onClick={() => void refreshLeetCode()} disabled={loading || !data.settings.username} title={data.syncStatus.lastSync ? `Last synced ${new Date(data.syncStatus.lastSync).toLocaleString()}` : 'Sync your LeetCode profile'}><RefreshCw size={14}/><span>{loading ? 'Syncing…' : 'Refresh from LeetCode'}</span></button><span className="local-pill">● Private & local</span><span className="avatar">{profile.username?.[0]?.toUpperCase() || 'R'}</span></div></header><div className="content">{notice && <div className="notice" role="status"><span>{notice}</span><button aria-label="Dismiss notice" onClick={() => setNotice('')}><X size={16}/></button></div>}
-      {page === 'dashboard' && <Dashboard model={model} profile={profile} count={data.catalogCount}/>}
-      {page === 'recommend' && <div className="recommend-layout"><div className={`filters-panel panel ${filterOpen ? 'open' : ''}`}><div className="panel-head"><h2>Filters</h2><SlidersHorizontal size={17}/></div><div className="filter-group"><label>Difficulty</label><div className="check-list">{(['Easy','Medium','Hard'] as Difficulty[]).map(d => <label key={d}><input type="checkbox" checked={filters.difficulties?.includes(d) ?? false} onChange={e => setFilters({ ...filters, difficulties: e.target.checked ? [...(filters.difficulties ?? []), d] : filters.difficulties?.filter(x => x !== d) })}/>{d}</label>)}</div></div><div className="filter-group"><label htmlFor="tags">Topic tags</label><select id="tags" value="" onChange={e => { if (e.target.value) setFilters({ ...filters, tags: [...new Set([...(filters.tags ?? []), e.target.value])] }); }}><option value="">Add a topic…</option>{data.tags.map(t => <option key={t}>{t}</option>)}</select><div className="tag-row">{filters.tags?.map(t => <button className="tag removable" key={t} onClick={() => setFilters({ ...filters, tags: filters.tags?.filter(x => x !== t) })}>{t} ×</button>)}</div></div><div className="filter-group"><label htmlFor="company">Company</label><select id="company" value={filters.companies?.[0] ?? ''} onChange={e => setFilters({ ...filters, companies: e.target.value ? [e.target.value] : [] })}><option value="">All companies</option>{data.companies.map(t => <option key={t}>{t}</option>)}</select><small>Only if catalog data includes company tags</small></div><div className="filter-group"><label htmlFor="access">Access</label><select id="access" value={filters.access} onChange={e => setFilters({ ...filters, access: e.target.value as SearchFilters['access'] })}><option value="all">All problems</option><option value="free">Free only</option><option value="paid">Premium only</option></select></div><div className="filter-group"><label htmlFor="status">Progress</label><select id="status" value={filters.status} onChange={e => setFilters({ ...filters, status: e.target.value as SearchFilters['status'] })}><option value="all">All relevant</option><option value="never-seen">Never seen</option><option value="unsolved">Unsolved</option><option value="attempted">Attempted</option><option value="solved">Solved / review</option></select></div><div className="filter-group"><label>Predicted solve chance: {Math.round((filters.minProbability ?? 0) * 100)}–{Math.round((filters.maxProbability ?? 1) * 100)}%</label><input type="range" min="0" max="100" value={(filters.minProbability ?? 0) * 100} onChange={e => setFilters({ ...filters, minProbability: Number(e.target.value) / 100 })}/><input type="range" min="0" max="100" value={(filters.maxProbability ?? 1) * 100} onChange={e => setFilters({ ...filters, maxProbability: Number(e.target.value) / 100 })}/></div><div className="filter-group"><label>Acceptance: {filters.minAcceptance ?? 0}–{filters.maxAcceptance ?? 100}%</label><input type="range" min="0" max="100" value={filters.minAcceptance ?? 0} onChange={e => setFilters({ ...filters, minAcceptance: Number(e.target.value) })}/><input type="range" min="0" max="100" value={filters.maxAcceptance ?? 100} onChange={e => setFilters({ ...filters, maxAcceptance: Number(e.target.value) })}/></div><button className="primary full" onClick={submitSearch}>Apply filters</button></div>
-        <div className="recommend-main"><div className="page-heading"><div><p className="eyebrow">PERSONALIZED PRACTICE</p><h1>Find your next problem<span className="accent">.</span></h1><p className="muted">The right challenge at the right time, based on how you solve.</p></div><button className="filter-toggle secondary" onClick={() => setFilterOpen(!filterOpen)}><SlidersHorizontal size={16}/> Filters</button></div><div className="search-bar"><Search size={19}/><input aria-label="Search title, ID, or tag" placeholder="Search by title, ID, or topic…" value={filters.query ?? ''} onChange={e => setFilters({ ...filters, query: e.target.value })} onKeyDown={e => { if (e.key === 'Enter') submitSearch(); }}/><button className="primary" onClick={submitSearch} disabled={loading}><Sparkles size={17}/>{loading ? 'Updating…' : 'Recommend for me'}</button></div>
-        <div className="result-toolbar"><div><strong>{recs.length} recommendations</strong><span> from {data.catalogCount.toLocaleString()} cached problems</span></div><div className="toolbar-selects"><select aria-label="Sort recommendations" value={filters.sort} onChange={e => { const next = { ...filters, sort: e.target.value as SearchFilters['sort'] }; setFilters(next); void runSearch(next); }}><option value="best">Best match</option><option value="difficulty">Difficulty</option><option value="acceptance">Acceptance</option><option value="likes">Likes</option><option value="newest">Newest</option></select><select aria-label="Group recommendations" value={filters.groupBy} onChange={e => { const next = { ...filters, groupBy: e.target.value as SearchFilters['groupBy'] }; setFilters(next); void runSearch(next); }}><option value="none">No grouping</option><option value="topic">Topic</option><option value="difficulty">Difficulty</option><option value="pattern">Pattern</option><option value="skill">Skill level</option></select></div></div>
-        {results && <div className="model-delta"><Sparkles size={16}/><span>Model updated: +{results.delta.newSolves} new solves{results.delta.changes.length ? ` · ${results.delta.changes.map(c => `${c.tag} ${c.before} → ${c.after}`).join(' · ')}` : ' · ratings current'}</span></div>}
-        {recs.length ? <div className="problem-list">{recs.map((item, i) => <React.Fragment key={item.problem.slug}>{filters.groupBy !== 'none' && (i === 0 || recs[i - 1].group !== item.group) && <h2 className="group-heading">{item.group}</h2>}<ProblemCard item={item} onFeedback={feedback} onSave={saveToList} busy={busySlug === item.problem.slug}/></React.Fragment>)}</div> : <div className="empty-state"><Compass size={30}/><h2>No recommendations yet</h2><p>{data.catalogCount ? 'Try broader filters or refresh the catalog.' : 'Refresh the catalog in Settings to load problems, or run npm run seed for a sample catalog.'}</p></div>}</div>
-        <aside className="right-panel"><div className="panel profile-panel"><div className="panel-head"><h2>Your profile</h2><span className="online-dot"/></div><div className="profile-avatar">{profile.username?.[0]?.toUpperCase() || 'R'}</div><strong>{profile.username || 'Add username'}</strong><p>{model.overall} estimated rating</p><div className="mini-stat"><span>Contest rating</span><strong>{profile.contestRating ? Math.round(profile.contestRating) : '—'}</strong></div><div className="mini-stat"><span>Global rank</span><strong>{profile.ranking ? `#${profile.ranking.toLocaleString()}` : '—'}</strong></div></div><div className="panel focus-panel"><h2>Focus areas</h2><p>Topics with room to grow</p>{model.weakTags.length ? model.weakTags.slice(0, 4).map(t => <div className="focus-row" key={t}><span>{t}</span><strong>{model.skills.find(s => s.tag === t)?.rating}</strong></div>) : <p className="muted">Keep solving to reveal patterns.</p>}</div><div className="tip-card"><Sparkles size={19}/><h3>How recommendations work</h3><p>We combine stretch fit, weak areas, uncertainty, quality, and topic variety. Each search replays your solve history.</p></div></aside></div>}
-      {page === 'roadmap' && <Roadmap model={model} recs={recs}/>}
-      {page === 'plan' && <div className="page-stack"><div className="page-heading"><div><p className="eyebrow">DAILY FOCUS</p><h1>Today's plan</h1><p className="muted">A balanced mix of warm-up, target, stretch, and review problems.</p></div><button className="secondary" onClick={() => void getPlan().then(setPlan)}>Refresh plan</button></div><div className="problem-list plan-list">{plan.map(item => <ProblemCard key={item.problem.slug} item={item} onFeedback={feedback} onSave={saveToList} busy={busySlug === item.problem.slug}/>)}</div>{!plan.length && <div className="empty-state">Refresh the catalog to build your plan.</div>}</div>}
-      {page === 'settings' && <SettingsPage key={`${data.settings.username}-${data.settings.hasSession}`} value={data.settings} onSave={save} onSession={setSession} onImport={importFile} onReset={reset} onRefresh={refreshCatalog} onSync={refreshLeetCode} lastSync={data.syncStatus.lastSync} catalogStatus={catalogStatus}/>}
-    </div></main></div>;
+function parseImport(content: string, name: string): string[] {
+  if (name.toLowerCase().endsWith('.json')) {
+    const value = JSON.parse(content);
+    const rows = Array.isArray(value) ? value : value.slugs ?? value.submissions ?? [];
+    return rows.map((row: unknown) => typeof row === 'string' ? row : typeof row === 'object' && row !== null && 'slug' in row ? String(row.slug) : '').filter(Boolean);
+  }
+  const lines = content.trim().split(/\r?\n/);
+  const columns = lines[0]?.split(',').map(value => value.trim().toLowerCase()) ?? [];
+  const index = columns.indexOf('slug');
+  return lines.slice(index < 0 ? 0 : 1).map(line => line.split(',')[Math.max(0, index)]?.trim()).filter(Boolean);
 }
+
+function App() {
+  const [data, setData] = useState<Bootstrap | null>(null);
+  const [results, setResults] = useState<SearchResponse | null>(null);
+  const [filters, setFilters] = useState<SearchFilters>({});
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [draft, setDraft] = useState<Settings | null>(null);
+  const [session, setSession] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState('');
+  const [catalogStatus, setCatalogStatus] = useState('');
+
+  const load = useCallback(async (next: SearchFilters, remote = false) => {
+    setBusy(remote);
+    try {
+      const value = await (remote ? search(next) : searchCached(next));
+      setResults(value);
+      setData(current => current ? { ...current, profile: value.profile, model: value.model, syncStatus: value.syncStatus, catalogCount: value.catalogCount } : current);
+      if (value.syncError) setNotice(`LeetCode sync failed. Using saved data: ${value.syncError}`);
+    } catch (error) { setNotice(String(error)); }
+    finally { setBusy(false); }
+  }, []);
+
+  useEffect(() => { void (async () => {
+    try {
+      const initial = await bootstrap(); setData(initial); setDraft(initial.settings);
+      await load({}, false); await load({}, true);
+    } catch (error) { setNotice(String(error)); }
+  })(); }, [load]);
+
+  const sync = async () => {
+    setBusy(true);
+    try {
+      const status = await api<{ newSolves: number; error: string }>('/sync', 'POST');
+      await load(filters);
+      setNotice(status.error ? `Saved data retained: ${status.error}` : `Sync complete. ${status.newSolves} new verified solves.`);
+    } catch (error) { setNotice(String(error)); }
+    finally { setBusy(false); }
+  };
+  const feedback = async (slug: string, action: 'solved' | 'skipped') => {
+    try { await api('/feedback', 'POST', { slug, action }); await load(filters); setNotice(action === 'solved' ? 'Solve saved locally.' : 'Skipped for 30 days.'); }
+    catch (error) { setNotice(String(error)); }
+  };
+  const save = async () => {
+    if (!draft) return;
+    setBusy(true);
+    try {
+      const value = await saveSettings(draft); setDraft(value);
+      const fresh = await bootstrap(); setData(fresh);
+      await load(filters); setSettingsOpen(false);
+      setNotice('Profile settings saved.');
+    } catch (error) { setNotice(String(error)); }
+    finally { setBusy(false); }
+  };
+  const refreshCatalog = async () => {
+    try {
+      await api('/catalog/refresh', 'POST'); setCatalogStatus('Catalog refresh running…');
+      const poll = window.setInterval(async () => {
+        try {
+          const job = await api<Bootstrap['catalogJob']>('/catalog/status');
+          setCatalogStatus(job.running ? `Loading ${job.loaded} problems…` : job.error || `Catalog updated: ${job.loaded} problems`);
+          if (!job.running) { window.clearInterval(poll); const fresh = await bootstrap(); setData(fresh); await load(filters); }
+        } catch { window.clearInterval(poll); setCatalogStatus('Catalog refresh failed. Saved catalog is available.'); }
+      }, 2000);
+    } catch (error) { setCatalogStatus(String(error)); }
+  };
+  const importFile = async (file: File) => {
+    try { const slugs = parseImport(await file.text(), file.name); const result = await api<{ imported: number; ignored: number }>('/import', 'POST', { slugs }); await load(filters); setNotice(`Imported ${result.imported} solves; ${result.ignored} entries ignored.`); }
+    catch (error) { setNotice(String(error)); }
+  };
+  if (!data) return <div className="loading" role="status">Loading RickyLeet… {notice}</div>;
+  const profile = results?.profile ?? data.profile;
+  const status = results?.syncStatus ?? data.syncStatus;
+  const recommendations = results?.recommendations ?? [];
+  const incomplete = status.reportedSolved > status.verifiedSolved;
+  const practiceRange = [...new Set(recommendations.slice(0, 10).map(item => item.problem.difficulty))].sort((a, b) => ['Easy', 'Medium', 'Hard'].indexOf(a) - ['Easy', 'Medium', 'Hard'].indexOf(b)).join('–') || 'Building model';
+  return <div className="app">
+    <header className="header"><div><h1>RickyLeet</h1><p>Choose the next problem with purpose.</p></div><div className="header-actions"><button className="button subtle" onClick={() => void sync()} disabled={busy || !data.settings.username}><RefreshCw size={16}/> Sync</button><button className="button subtle" onClick={() => setSettingsOpen(true)}><Settings2 size={16}/> Settings</button></div></header>
+    <main className="workspace">
+      {notice && <div className="notice" role="status">{notice}<button onClick={() => setNotice('')} aria-label="Dismiss"><X size={15}/></button></div>}
+      <section className="summary" aria-label="Profile summary"><div><span className="label">PROFILE</span><strong>{profile.username || 'Add a username in Settings'}</strong></div><div><span className="label">VERIFIED SOLVES</span><strong>{status.verifiedSolved}</strong></div><div><span className="label">PRACTICE RANGE</span><strong>{practiceRange}</strong></div><div><span className="label">LAST SYNC</span><strong>{status.lastSync ? new Date(status.lastSync).toLocaleString() : 'Not yet synced'}</strong></div></section>
+      {incomplete && <p className="coverage" role="note">LeetCode reports {status.reportedSolved} solves; RickyLeet has identifiers for {status.verifiedSolved}. Public history may be incomplete. Add a session cookie or import solved slugs to improve exclusion.</p>}
+      <section className="discovery"><div className="section-head"><div><span className="label">YOUR NEXT STEP</span><h2>Recommended problems</h2></div><button className="button primary" disabled={busy} onClick={() => void load(filters, true)}>{busy ? 'Updating…' : 'Refresh recommendations'}</button></div>
+        <div className="controls"><label className="search-field"><Search size={17}/><input aria-label="Search problems" placeholder="Search title, ID, or topic" value={filters.query ?? ''} onChange={e => setFilters({ ...filters, query: e.target.value })} onKeyDown={e => { if (e.key === 'Enter') void load(filters); }}/></label><select aria-label="Topic filter" value={filters.tags?.[0] ?? ''} onChange={e => { const next = { ...filters, tags: e.target.value ? [e.target.value] : [] }; setFilters(next); void load(next); }}><option value="">All topics</option>{data.tags.map(tag => <option key={tag} value={tag}>{tag}</option>)}</select><select aria-label="Difficulty filter" value={filters.difficulties?.[0] ?? ''} onChange={e => { const next = { ...filters, difficulties: e.target.value ? [e.target.value as Difficulty] : [] }; setFilters(next); void load(next); }}><option value="">All difficulties</option>{(['Easy','Medium','Hard'] as Difficulty[]).map(difficulty => <option key={difficulty}>{difficulty}</option>)}</select><button className="button subtle" onClick={() => void load(filters)}>Apply</button></div>
+        <div className="list-meta">{recommendations.length} unsolved suggestions from {data.catalogCount.toLocaleString()} cached problems</div>
+        <div className="problem-list">{recommendations.map(item => <article className="problem-row" key={item.problem.slug}><div className="problem-main"><div className="problem-heading"><span className="problem-id">#{item.problem.id}</span><h3>{item.problem.title}</h3><span className={`difficulty ${item.problem.difficulty.toLowerCase()}`}>{item.problem.difficulty}</span></div><div className="tags">{item.problem.tags.slice(0, 3).map(tag => <span key={tag}>{tag}</span>)}</div><p>{item.reason}</p></div><div className="row-actions"><a href={`https://leetcode.com/problems/${item.problem.slug}/`} target="_blank" rel="noopener noreferrer" aria-label={`Open ${item.problem.title} on LeetCode`}><ExternalLink size={16}/> Open</a><button onClick={() => void feedback(item.problem.slug, 'solved')}>Solved</button><button onClick={() => void feedback(item.problem.slug, 'skipped')}>Skip</button></div></article>)}</div>
+        {!recommendations.length && <div className="empty">{data.catalogCount ? 'No unsolved problems match these filters.' : 'Refresh the catalog in Settings to load problems.'}</div>}
+      </section>
+    </main>
+    {settingsOpen && draft && <div className="dialog-backdrop" onClick={() => setSettingsOpen(false)}><section className="settings-dialog" role="dialog" aria-modal="true" aria-label="Settings" onClick={e => e.stopPropagation()}><div className="dialog-head"><h2>Settings</h2><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={19}/></button></div><label>LeetCode username<input value={draft.username} onChange={e => setDraft({ ...draft, username: e.target.value })} placeholder="your-username"/></label><div className="setting-actions"><button className="button primary" disabled={busy} onClick={() => void save()}>Save profile</button><button className="button subtle" disabled={busy || !draft.username} onClick={() => void sync()}>Sync now</button></div><hr/><h3>Problem catalog</h3><p>Metadata is cached locally. A refresh may take several minutes.</p><button className="button subtle" onClick={() => void refreshCatalog()}>Refresh catalog</button><span className="setting-note">{catalogStatus}</span><hr/><h3>Complete solved history</h3><p>Public LeetCode data usually gives recent accepted submissions, not a complete solved list. You can import slugs or provide a session cookie.</p><label className="upload button subtle">Import solved JSON or CSV<input type="file" accept=".json,.csv,.txt" onChange={e => { const file = e.target.files?.[0]; if (file) void importFile(file); e.target.value = ''; }}/></label><p className="warning">Security: a LEETCODE_SESSION cookie grants account access. It is sent to this local server once, encrypted on disk, and sent only to LeetCode. Revoke it by logging out of LeetCode.</p><label>Session cookie<input type="password" autoComplete="off" value={session} onChange={e => setSession(e.target.value)} placeholder={draft.hasSession ? 'Saved locally' : 'Optional'}/></label><div className="setting-actions"><button className="button subtle" disabled={!session} onClick={() => void api('/session', 'POST', { session }).then(() => { setSession(''); setNotice('Session saved locally.'); })}>Save cookie</button><button className="button subtle" onClick={() => void api('/session', 'POST', { session: '' }).then(() => setNotice('Saved session cleared.'))}>Clear</button><a className="button subtle" href="/api/export" download>Export data</a></div></section></div>}
+  </div>;
+}
+
 createRoot(document.getElementById('root')!).render(<App/>);

@@ -1,67 +1,50 @@
 # RickyLeet
 
-Local, private LeetCode practice recommendations powered by a per-topic capability model.
-
-## Architecture and data model
-
-```text
-Browser (React + Vite + Tailwind)
-  → typed /api contract
-Local Express server (TypeScript)
-  → LeetCode GraphQL adapter (throttled to ~1 request/second)
-  → SQLite cache (better-sqlite3)
-  → pure capability engine (replay + ranking)
-```
-
-SQLite tables: `problems` caches catalog metadata and optional contest ratings; `submissions` stores public, session, imported, and manual events; `ratings` stores the latest recomputed skills; `kv` stores profile, settings, and the encrypted optional session cookie; `lists` and `list_items` hold saved problems. The database and encryption key stay in `data/`.
+A local LeetCode practice coach. It keeps a cached problem catalog and verified solves in SQLite, then ranks unsolved problems using your actual practice history.
 
 ## Run
 
-1. Install Node.js 20.19+ (Node 24 recommended).
-2. Run `npm install`.
-3. Copy `.env.example` to `.env`. You may leave `LEETCODE_SESSION` blank. If you set it, keep `.env` private.
-4. Run `npm run dev` and open [http://localhost:5173](http://localhost:5173).
-5. In Settings, enter your LeetCode username and save. Click **Refresh catalog**. The first refresh may take several minutes because catalog pages and vote-count batches are throttled. RickyLeet saves your profile and submissions in SQLite, checks LeetCode in the background on server start, and checks again on each search. Cached recommendations appear immediately while a search sync runs. Use **Refresh from LeetCode** at any time to force a sync; the UI shows the last successful sync time and errors.
-6. If LeetCode is unavailable, run `npm run seed` for a small sample catalog and import solved slugs from JSON or CSV.
+1. Install Node.js 20.19 or newer.
+2. In this repository, run `npm install`.
+3. Copy `.env.example` to `.env`. Leave `LEETCODE_SESSION` empty unless you choose to use authenticated history.
+4. Run `npm run dev` and open http://localhost:5173. This starts the Express API on `127.0.0.1:3001` and Vite on `localhost:5173`.
+5. Open **Settings**, enter your LeetCode username, and save. Use **Refresh catalog** the first time to download problem metadata. The catalog refresh is throttled and can take several minutes.
+6. Use **Sync** to force a profile update. RickyLeet also checks on startup and when refreshing recommendations, with a five minute sync cache to avoid duplicate calls.
 
-`npm run build` checks both TypeScript projects and builds the web app. `npm test` runs the capability engine tests. The backend listens only on `127.0.0.1:3001`; Vite proxies `/api` to it.
+`npm test` runs the engine, storage, and failure tests. `npm run build` type checks both apps and builds the frontend. There is no lint script in this repository.
 
-## Capability algorithm
+## Data and sync
 
-1. Initialize overall skill from contest rating plus solved counts. Initialize each topic from the overall baseline and public tag-wise counts.
-2. Replay local submission events in timestamp order. For each event, use `expected = 1 / (1 + 10^((problemRating - skillRating) / 400))`, then `rating += K × (outcome - expected)`. First-try accepted is 1; later accepted is 0.5–0.7; accepted with hints or over two hours is 0.4; failed or abandoned is 0. Old events have `K` multiplied by `2^(-ageDays / halfLifeDays)`.
-3. Confidence rises with weighted evidence. A topic is weak when its rating is 90+ below overall or its recorded failure rate exceeds 45% after at least three attempts.
-4. Every search starts with saved recommendations, syncs available submissions, rebuilds the model, and scores cached problems again. Concurrent startup, search, and manual refresh triggers share one sync request. Stretch fit peaks at 65% predicted solve chance. Weakness, uncertainty, quality, diversity, and recent topic fatigue are weighted by Settings sliders. Solved problems return for review on a 1, 3, 7, 21, 60 day cadence when they were difficult or the topic is weak.
+The Express adapter requests public profile totals, topic counts, contest rating, and up to 20 recent accepted submissions in one GraphQL request. The public totals do **not** identify every solved problem. The workspace shows both the reported total and the count of locally verified problem identifiers when they differ. Previously saved accepted events are never erased by a short response or network failure.
 
-Tune the weight sliders to emphasize stretch practice, weak topics, exploration, quality, diversity, or freshness. **Interview Prep**, **Contest Training**, **Weak Spot Fixer**, and **Easy Warm-up** apply presets. The half-life slider changes how fast old practice loses influence.
+For more complete history, paste a `LEETCODE_SESSION` value in Settings or set it in `.env`. The local server stores a pasted cookie encrypted with a local key and never returns it to the browser. The optional history request retrieves pages of submissions incrementally, up to 4,000 events per sync. You can also import solved slugs from a JSON array, `{ "slugs": ["two-sum"] }`, or a CSV `slug` column. Imported slugs must already exist in the cached catalog. Manual **Solved** actions are verified locally and immediately leave the unsolved feed.
 
-## Import format
+The SQLite file and session key live under `data/` by default. Set `DATABASE_PATH` to choose a different location. Do not publish `.env`, `data/`, or the session key.
 
-JSON: `["two-sum", "valid-parentheses"]` or `{ "slugs": ["two-sum"] }`. CSV: a `slug` column, one solved slug per row. Import only records slugs already present in the cached catalog. The export endpoint returns settings, profile, submissions, and lists, without the session cookie.
+## Recommendation algorithm
 
-## Privacy and limitations
+The pure engine in `server/engine/capabilityEngine.ts` builds topic estimates by replaying saved submissions chronologically with Elo-style updates and a configurable 90 day evidence half-life. A rating is a bounded signal; topic familiarity and solved-problem similarity drive the main ranking. Candidate scoring combines familiar topics, shared tags with prior solves, a gradual difficulty step, a modest weak-topic and exploration boost, and a small quality signal. Recently shown relevant items receive a continuity boost; skipped items pause for 30 days. A deterministic diversity pass prevents one tag from filling the list.
 
-- All user data stays in local SQLite. There is no analytics. The server contacts LeetCode for catalog/profile/history and Zerotrac only when optional contest ratings are enabled.
-- `LEETCODE_SESSION` grants account access. The browser field sends it once to the local server; it is encrypted with a local key in `data/session.key`, never returned by APIs, and never logged. An `.env` cookie is also supported. Protect backups of both files. Clearing a stored cookie does not revoke it on LeetCode; log out there to revoke it.
-- LeetCode GraphQL is unofficial and can change or rate-limit. Public profiles expose only recent accepted submissions, so first-try/attempt timing is approximate unless full session history or manual feedback is available. The full-history adapter has a 4,000-submission cap per sync. A failed sync leaves cached data usable.
-- Company tags are shown only if present in catalog data; LeetCode's public metadata query may not provide them. Premium problem statements are never fetched.
-- The score is a practice heuristic, not an official LeetCode rating or a validated prediction of success. Imported solves use import time when historical timestamps are absent.
+The primary candidate query excludes accepted solves using the catalog's stable problem ID. The engine performs the same exclusion as a safeguard. This guarantee covers **verified** identifiers in the local database; an unknown historical solve cannot be identified from a public aggregate count alone.
 
-## File tree
+## Architecture
 
 ```text
-server/
-  adapters/leetcode.ts       GraphQL and optional rating dataset
-  db/index.ts, seed.ts        SQLite schema, persistence, sample seed
-  engine/capabilityEngine.ts  Pure model and ranking functions
-  engine/capabilityEngine.test.ts
-  routes/api.ts               Local typed API endpoints
-  index.ts                    Express entry point
-shared/types.ts               Frontend/backend API contract
-web/
-  src/api.ts                  Typed API client
-  src/components/ProblemCard.tsx
-  src/pages/{Dashboard,Roadmap,Settings}.tsx
-  src/main.tsx, style.css     React UI
-  vite.config.ts
+web/src/                   React workspace, settings panel, API client, matte theme
+shared/types.ts            Shared TypeScript API and model types
+server/adapters/leetcode.ts Throttled GraphQL adapter
+server/db/index.ts         SQLite schema, migrations, persistence, account snapshots
+server/engine/             Pure capability and ranking engine with tests
+server/routes/api.ts       Profile sync, catalog refresh, feedback, import/export, search
+server/index.ts            Local Express entry point
 ```
+
+The database migration adds account-scoped recommendation history and skips, with indexes. Existing `problems`, `submissions`, `ratings`, and account snapshots remain intact. The earlier dashboard, roadmap, plan navigation, chart dependency, and unused list/plan API routes were removed because the recommendation workspace presents the relevant progress and actions directly. Legacy saved lists remain in SQLite and in data export.
+
+## Limitations
+
+- LeetCode GraphQL is unofficial and may change or rate-limit. A failed sync leaves cached progress available.
+- Public recent submissions cover only a limited window. Full exclusion requires a valid session or a solved-slug import when older solves are not visible publicly.
+- Authenticated history is capped at 4,000 submission events per sync. An expired cookie must be replaced. A cookie grants account access; protect `.env`, the SQLite file, and `data/session.key`.
+- Company tags and premium problem statements are not fetched. RickyLeet links to LeetCode for the full problem.
+- Predicted solve chance and skill estimates are practice heuristics, not official LeetCode measures.

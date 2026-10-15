@@ -36,6 +36,7 @@ export function buildModel(problems: Problem[], submissions: Submission[], profi
   const activity = new Map<string, number>();
   const ordered = [...submissions].sort((a, b) => a.timestamp - b.timestamp || a.id.localeCompare(b.id));
   const failedSinceAccepted = new Map<string, number>();
+  const acceptedCount = new Map<string, number>();
   for (const s of ordered) {
     const p = bySlug.get(s.slug);
     if (!p) continue;
@@ -45,14 +46,17 @@ export function buildModel(problems: Problem[], submissions: Submission[], profi
     const outcome = outcomeFor({ ...s, attempts });
     if (s.status === 'accepted') failedSinceAccepted.set(s.slug, 0); else failedSinceAccepted.set(s.slug, (failedSinceAccepted.get(s.slug) ?? 0) + 1);
     const difficulty = problemRating(p, settings.useContestRatings);
-    const k = 38 * weight;
+    // Repeat accepts are useful practice but must not act like distinct solved problems.
+    const repeat = s.status === 'accepted' ? acceptedCount.get(s.slug) ?? 0 : 0;
+    const k = 38 * weight * (repeat ? 0.15 : 1);
+    if (s.status === 'accepted') acceptedCount.set(s.slug, repeat + 1);
     overall = eloUpdate(overall, difficulty, outcome, k * 0.4);
     for (const tag of p.tags) {
       const item = state.get(tag) ?? { rating: base, attempts: 0, failures: 0, evidence: 0 };
       item.rating = eloUpdate(item.rating, difficulty, outcome, k / Math.sqrt(Math.max(1, p.tags.length / 2)));
       item.attempts++;
       item.failures += s.status !== 'accepted' ? 1 : 0;
-      item.evidence += weight;
+      item.evidence += weight * (repeat ? 0.15 : 1);
       state.set(tag, item);
     }
     if (s.status === 'accepted') { const date = new Date(s.timestamp).toISOString().slice(0, 10); activity.set(date, (activity.get(date) ?? 0) + 1); }
@@ -64,8 +68,6 @@ export function buildModel(problems: Problem[], submissions: Submission[], profi
 
 export function targetFit(probability: number) { return clamp(1 - Math.abs(probability - 0.65) / 0.65, 0, 1); }
 export function qualityScore(p: Problem) { const likes = p.likes + p.dislikes; const ratio = likes ? (p.likes + 10) / (likes + 20) : 0.55; return clamp(ratio * 0.75 + (p.acceptance >= 5 && p.acceptance <= 90 ? 0.25 : 0), 0, 1); }
-const reviewIntervals = [1, 3, 7, 21, 60];
-function reviewDue(events: Submission[], now: number, weak: boolean) { const accepted = events.filter(s => s.status === 'accepted'); const last = accepted.at(-1); if (!last) return false; const age = (now - last.timestamp) / DAY; const stage = Math.min(reviewIntervals.length - 1, accepted.length - 1); return age >= reviewIntervals[stage] && (weak || last.attempts > 1 || age >= 60 || accepted.length > 1); }
 function groupFor(p: Problem, mode: SearchFilters['groupBy'], model: Model) { if (mode === 'difficulty') return p.difficulty; if (mode === 'topic') return p.tags[0] ?? 'Other'; if (mode === 'pattern') return p.tags.find(t => ['Two Pointers', 'Sliding Window', 'Binary Search', 'Backtracking', 'Depth-First Search', 'Breadth-First Search', 'Greedy'].includes(t)) ?? p.tags[0] ?? 'Other'; if (mode === 'skill') { const value = Math.min(...p.tags.map(t => model.skills.find(s => s.tag === t)?.rating ?? defaultAbility)); return value < model.overall - 90 ? 'Growth area' : value > model.overall + 90 ? 'Strength' : 'On level'; } return undefined; }
 
 type SolvedExample = { problem: Problem; timestamp: number; rating: number };
@@ -150,24 +152,27 @@ function recommendationAbility(p: Problem, skill: Map<string, Skill>, history: H
   return { ability: abilityTotal / p.tags.length, topicLevel: levelTotal / levelWeights, historyCount: countTotal / p.tags.length };
 }
 
-export function recommend(problems: Problem[], submissions: Submission[], model: Model, settings: Settings, filters: SearchFilters = {}, now = Date.now(), limit = 80): Recommendation[] {
+export type RecommendationContext = { previous?: Map<string, { shownAt: number; position: number }>; skipped?: Map<string, number>; candidates?: Set<string> };
+export function recommend(problems: Problem[], submissions: Submission[], model: Model, settings: Settings, filters: SearchFilters = {}, now = Date.now(), limit = 80, context: RecommendationContext = {}): Recommendation[] {
   const status = new Map<string, Submission[]>();
   for (const s of submissions) { const list = status.get(s.slug) ?? []; list.push(s); status.set(s.slug, list); }
   const skill = new Map(model.skills.map(s => [s.tag, s]));
   const history = makeHistoryProfile(problems, submissions, now, settings.useContestRatings);
   const recentTags = new Map<string, number>();
   const bySlug = new Map(problems.map(p => [p.slug, p]));
+  const solvedIds = new Set(submissions.filter(s => s.status === 'accepted').map(s => bySlug.get(s.slug)?.id).filter((id): id is string => !!id));
   for (const s of submissions) if (now - s.timestamp < 7 * DAY) for (const tag of bySlug.get(s.slug)?.tags ?? []) recentTags.set(tag, (recentTags.get(tag) ?? 0) + 1);
   const query = (filters.query ?? '').toLowerCase().trim();
   const candidates: Recommendation[] = [];
   for (const p of problems) {
+    if (context.candidates && !context.candidates.has(p.slug)) continue;
     const events = status.get(p.slug) ?? [];
-    const lastAccepted = [...events].reverse().find(s => s.status === 'accepted');
-    const solved = events.some(s => s.status === 'accepted');
-    const state = solved ? 'solved' : events.some(s => s.status === 'attempted' || s.status === 'failed') ? 'attempted' : events.some(s => s.source === 'feedback') ? 'skipped' : 'unsolved';
-    const weak = p.tags.some(t => skill.get(t)?.weak);
-    const review = solved && reviewDue(events, now, weak);
-    if (solved && !review && filters.status !== 'solved') continue;
+    const solved = events.some(s => s.status === 'accepted') || solvedIds.has(p.id);
+    // The primary feed contains only problems without a verified accepted event.
+    if (solved) continue;
+    const skippedAt = context.skipped?.get(p.slug);
+    if (skippedAt && now - skippedAt < 30 * DAY) continue;
+    const state = events.some(s => s.status === 'attempted' || s.status === 'failed') ? 'attempted' : 'unsolved';
     if (filters.status && filters.status !== 'all' && (filters.status === 'never-seen' ? events.length > 0 : state !== filters.status)) continue;
     if (query && !`${p.title} ${p.id} ${p.tags.join(' ')}`.toLowerCase().includes(query)) continue;
     if (filters.difficulties?.length && !filters.difficulties.includes(p.difficulty)) continue;
@@ -200,21 +205,21 @@ export function recommend(problems: Problem[], submissions: Submission[], model:
     const explorationWeight = clamp(w.exploration / 1.5, 0, 2);
     // Initial mix: 60% history/similarity, 25% progression, 10% weak areas, 5% exploration.
     const progressionScore = progression * 0.55 + targetFit(probability) * 0.45;
-    const score = 0.60 * familiarity + 0.25 * progressionScore * targetWeight + 0.10 * weaknessWeight * weakness + 0.05 * explorationWeight * exploration
-      + 0.08 * w.quality * qualityScore(p)
-      - 0.10 * w.fatigue * fatigue - negativeFeedback + (review ? 0.4 : 0);
+    const previous = context.previous?.get(p.slug);
+    const continuity = previous && now - previous.shownAt < 21 * DAY ? 0.10 * Math.exp(-previous.position / 20) : 0;
+    const score = 0.30 * familiarity + 0.20 * similarity.score + 0.25 * progressionScore * targetWeight + 0.10 * weaknessWeight * weakness + 0.05 * explorationWeight * exploration
+      + 0.04 * w.quality * qualityScore(p) + continuity
+      - 0.08 * w.fatigue * fatigue - negativeFeedback;
     const firstTag = p.tags.find(t => history.topic.has(t)) ?? p.tags[0];
     const topicName = firstTag ?? 'new topics';
-    const reason = review
-      ? `Review due after ${Math.floor((now - lastAccepted!.timestamp) / DAY)} days. ${firstTag ?? 'This topic'} needs reinforcement.`
-      : history.solved.length && similarity.example
+    const reason = history.solved.length && similarity.example
         ? `Similar to ${similarity.example.problem.title}; shares ${similarity.sharedTags.slice(0, 2).join(' and ')}. ${p.difficulty} difficulty fits your ${topicName} progression. Predicted solve chance ${Math.round(probability * 100)}%.`
         : history.solved.length && history.topic.has(topicName)
           ? `Matches your recent ${topicName} practice. ${p.difficulty} difficulty fits your demonstrated range; predicted solve chance ${Math.round(probability * 100)}%.`
           : history.solved.length
             ? `Introduces ${topicName} at an introductory level. Predicted solve chance ${Math.round(probability * 100)}%.`
             : `Beginner-friendly starting point. Predicted solve chance ${Math.round(probability * 100)}%.`;
-    candidates.push({ problem: p, score, probability, estimatedMinutes: Math.round(({ Easy: 20, Medium: 40, Hard: 65 })[p.difficulty] * (1.2 - probability * 0.4)), reason, review, status: state, group: groupFor(p, filters.groupBy, model) });
+    candidates.push({ problem: p, score, probability, estimatedMinutes: Math.round(({ Easy: 20, Medium: 40, Hard: 65 })[p.difficulty] * (1.2 - probability * 0.4)), reason, review: false, status: state, group: groupFor(p, filters.groupBy, model) });
   }
   const stableTie = (a: Recommendation, b: Recommendation) => a.problem.slug.localeCompare(b.problem.slug);
   if (filters.sort === 'difficulty') candidates.sort((a, b) => problemRating(a.problem, settings.useContestRatings) - problemRating(b.problem, settings.useContestRatings) || stableTie(a, b));
@@ -230,7 +235,7 @@ export function recommend(problems: Problem[], submissions: Submission[], model:
     for (let i = 0; i < Math.min(candidates.length, 250); i++) {
       const c = candidates[i];
       const diversity = c.problem.tags.length ? c.problem.tags.reduce((n, t) => n + 1 / (1 + (used.get(t) ?? 0)), 0) / c.problem.tags.length : 1;
-      const value = c.score + settings.weights.diversity * diversity;
+      const value = c.score + 0.10 * clamp(settings.weights.diversity / 1.5, 0, 2) * diversity;
       if (value > bestScore || (value === bestScore && stableTie(c, candidates[best]) < 0)) { best = i; bestScore = value; }
     }
     const [picked] = candidates.splice(best, 1); picked.score = bestScore; result.push(picked);

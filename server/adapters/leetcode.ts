@@ -1,15 +1,19 @@
 import type { Problem, Profile, Submission } from '../../shared/types.js';
 
 const endpoint = 'https://leetcode.com/graphql/';
+class PermanentLeetCodeError extends Error {}
 let lastRequest = 0;
 let queue = Promise.resolve();
 let csrfToken = '';
+let csrfSession = '';
 async function prepareSession(session: string) {
-  if (csrfToken) return;
+  if (csrfSession === session) return;
+  csrfToken = '';
   await throttle();
   const response = await fetch('https://leetcode.com/', { headers: { cookie: `LEETCODE_SESSION=${session}` }, signal: AbortSignal.timeout(20000) });
   const cookies = response.headers.getSetCookie?.() ?? [response.headers.get('set-cookie') ?? ''];
   csrfToken = cookies.map(c => /(?:^|;\s*)csrftoken=([^;]+)/.exec(c)?.[1]).find(Boolean) ?? '';
+  csrfSession = session;
 }
 async function throttle() { const task = queue.then(async () => { const delay = Math.max(0, 1050 - (Date.now() - lastRequest)); if (delay) await new Promise(resolve => setTimeout(resolve, delay)); lastRequest = Date.now(); }); queue = task.catch(() => {}); await task; }
 async function gql<T>(query: string, variables: Record<string, unknown> = {}, session?: string): Promise<T> {
@@ -18,13 +22,13 @@ async function gql<T>(query: string, variables: Record<string, unknown> = {}, se
     try {
       const response = await fetch(endpoint, { method: 'POST', headers: { 'content-type': 'application/json', 'referer': 'https://leetcode.com/', 'origin': 'https://leetcode.com', ...(session ? { cookie: `LEETCODE_SESSION=${session}${csrfToken ? `; csrftoken=${csrfToken}` : ''}`, ...(csrfToken ? { 'x-csrftoken': csrfToken } : {}) } : {}) }, body: JSON.stringify({ query, variables }), signal: AbortSignal.timeout(20000) });
       if (response.status === 429 || response.status >= 500) throw new Error(`LeetCode HTTP ${response.status}`);
-      if (!response.ok) throw new Error(`LeetCode HTTP ${response.status}`);
+      if (!response.ok) throw new PermanentLeetCodeError(`LeetCode HTTP ${response.status}`);
       const payload = await response.json() as { data?: T; errors?: { message: string }[] };
-      if (payload.errors?.length) throw new Error(payload.errors[0].message);
-      if (!payload.data) throw new Error('LeetCode returned no data');
+      if (payload.errors?.length) throw new PermanentLeetCodeError(payload.errors[0].message);
+      if (!payload.data) throw new PermanentLeetCodeError('LeetCode returned no data');
       return payload.data;
     } catch (error) {
-      if (attempt === 3) throw error;
+      if (attempt === 3 || error instanceof PermanentLeetCodeError) throw error;
       await new Promise(resolve => setTimeout(resolve, 1000 * 2 ** attempt));
     }
   }
@@ -64,7 +68,7 @@ export async function fetchVotes(slugs: string[], onBatch: (items: { slug: strin
   }
 }
 
-export async function fetchProfile(username: string): Promise<Profile> {
+export async function fetchProfileSnapshot(username: string): Promise<{ profile: Profile; recent: Submission[] }> {
   const query = `query profile($username: String!) { matchedUser(username: $username) { username profile { ranking } submitStatsGlobal { acSubmissionNum { difficulty count } } tagProblemCounts { advanced { tagName problemsSolved } intermediate { tagName problemsSolved } fundamental { tagName problemsSolved } } } userContestRanking(username: $username) { rating } recentAcSubmissionList(username: $username, limit: 20) { id titleSlug timestamp } }`;
   const data = await gql<{ matchedUser: { username: string; profile?: { ranking?: number }; submitStatsGlobal?: { acSubmissionNum?: { difficulty: string; count: number }[] }; tagProblemCounts?: Record<string, { tagName: string; problemsSolved: number }[]> }; userContestRanking?: { rating?: number }; recentAcSubmissionList?: { id: string; titleSlug: string; timestamp: string }[] }>(query, { username });
   if (!data.matchedUser) throw new Error('LeetCode username not found');
@@ -72,16 +76,15 @@ export async function fetchProfile(username: string): Promise<Profile> {
   for (const item of data.matchedUser.submitStatsGlobal?.acSubmissionNum ?? []) if (item.difficulty in solved) solved[item.difficulty as keyof typeof solved] = item.count;
   const tagStats: Record<string, number> = {};
   for (const group of Object.values(data.matchedUser.tagProblemCounts ?? {})) for (const item of group) tagStats[item.tagName] = item.problemsSolved;
-  return { username, ranking: data.matchedUser.profile?.ranking, contestRating: data.userContestRanking?.rating, solved, tagStats, lastSync: Date.now() };
+  return { profile: { username, ranking: data.matchedUser.profile?.ranking, contestRating: data.userContestRanking?.rating, solved, tagStats, lastSync: Date.now() }, recent: (data.recentAcSubmissionList ?? []).map(s => ({ id: `public:${s.id}`, slug: s.titleSlug, timestamp: Number(s.timestamp) * 1000, status: 'accepted', attempts: 1, source: 'public' })) };
 }
+export async function fetchProfile(username: string): Promise<Profile> { return (await fetchProfileSnapshot(username)).profile; }
 
-export async function fetchRecent(username: string): Promise<Submission[]> {
-  const data = await gql<{ recentAcSubmissionList?: { id: string; titleSlug: string; timestamp: string }[] }>(`query recent($username: String!) { recentAcSubmissionList(username: $username, limit: 20) { id titleSlug timestamp } }`, { username });
-  return (data.recentAcSubmissionList ?? []).map(s => ({ id: `public:${s.id}`, slug: s.titleSlug, timestamp: Number(s.timestamp) * 1000, status: 'accepted', attempts: 1, source: 'public' }));
-}
-
-export async function fetchFullHistory(session: string, knownIds = new Set<string>(), maxPages = 40): Promise<Submission[]> {
+export async function fetchFullHistory(session: string, knownIds = new Set<string>(), maxPages = 40, expectedUsername = ''): Promise<Submission[]> {
   await prepareSession(session);
+  const owner = await gql<{ userStatus?: { username?: string } }>('query sessionOwner { userStatus { username } }', {}, session);
+  if (!owner.userStatus?.username) throw new Error('Session is expired or invalid');
+  if (expectedUsername && owner.userStatus.username.toLowerCase() !== expectedUsername.toLowerCase()) throw new Error('Session belongs to another LeetCode account');
   const query = `query history($offset: Int!, $limit: Int!) { submissionList(offset: $offset, limit: $limit) { hasNext submissions { id titleSlug statusDisplay timestamp runtime } } }`;
   const all: Submission[] = [];
   for (let page = 0; page < maxPages; page++) {
