@@ -1,23 +1,25 @@
 import { Router } from 'express';
+import { waitUntil } from '@vercel/functions';
 import { randomBytes, createCipheriv, createDecipheriv } from 'node:crypto';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import type { SearchFilters, Settings, Submission, SyncStatus } from '../../shared/types.js';
 import { fetchCatalog, fetchFullHistory, fetchProfileSnapshot, fetchRatings, fetchVotes } from '../adapters/leetcode.js';
 import { buildModel, recommend } from '../engine/capabilityEngine.js';
-import { db, getKV, getProblems, getProfile, getRecommendationHistory, getSettings, getSkipped, getSubmissions, getUnsolvedProblems, getVerifiedSolved, recordRecommendations, saveProblems, saveSubmissions, setKV, skipRecommendation, switchAccount } from '../db/index.js';
+import { currentOwner, multiUser } from '../context.js';
+import { databasePath, db, getKV, getLegacyLists, getProblems, getProfile, getRecommendationHistory, getSettings, getSkipped, getSubmissions, getUnsolvedProblems, getVerifiedSolved, recordRecommendations, saveProblems, saveRatings, saveSubmissions, setKV, skipRecommendation, switchAccount } from '../db/index.js';
 
 export const api = Router();
 const errorText = (error: unknown) => error instanceof Error ? error.message : 'Unknown error';
 let catalogJob = { running: false, loaded: 0, total: 0, phase: '', error: '' };
-const secretPath = resolve(dirname(process.env.DATABASE_PATH || './data/rickyleet.sqlite'), 'session.key');
+const secretPath = resolve(dirname(databasePath), 'session.key');
 function sessionKey() { mkdirSync(dirname(secretPath), { recursive: true }); if (!existsSync(secretPath)) writeFileSync(secretPath, randomBytes(32), { mode: 0o600 }); return readFileSync(secretPath); }
 function encrypt(value: string) { const iv = randomBytes(12); const cipher = createCipheriv('aes-256-gcm', sessionKey(), iv); const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]); return Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString('base64'); }
 function decrypt(value: string) { const raw = Buffer.from(value, 'base64'); const decipher = createDecipheriv('aes-256-gcm', sessionKey(), raw.subarray(0, 12)); decipher.setAuthTag(raw.subarray(12, 28)); return Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString('utf8'); }
-function getSession() { const encrypted = getKV<string>('encryptedSession', ''); return process.env.LEETCODE_SESSION || (encrypted ? decrypt(encrypted) : ''); }
-let syncPromise: Promise<{ newSolves: number; error: string }> | undefined;
-let activeUsername = '';
-export function getSyncStatus(): SyncStatus { const reported = getProfile().solved; const reportedSolved = reported.Easy + reported.Medium + reported.Hard; return { running: !!syncPromise, lastSync: getKV<number | undefined>('lastSyncAt', undefined), lastError: getKV<string>('lastSyncError', ''), newSolves: getKV<number>('lastSyncNewSolves', 0), verifiedSolved: getVerifiedSolved().size, reportedSolved }; }
+function getSession() { const encrypted = getKV<string>('encryptedSession', ''); return (multiUser ? '' : process.env.LEETCODE_SESSION) || (encrypted ? decrypt(encrypted) : ''); }
+// In-flight syncs are tracked per owner so one visitor never waits on (or reuses) another's sync.
+const syncs = new Map<string, { username: string; promise: Promise<{ newSolves: number; error: string }> }>();
+export function getSyncStatus(): SyncStatus { const reported = getProfile().solved; const reportedSolved = reported.Easy + reported.Medium + reported.Hard; return { running: syncs.has(currentOwner()), lastSync: getKV<number | undefined>('lastSyncAt', undefined), lastError: getKV<string>('lastSyncError', ''), newSolves: getKV<number>('lastSyncNewSolves', 0), verifiedSolved: getVerifiedSolved().size, reportedSolved }; }
 async function syncOnce(username: string) {
   if (!username) return { newSolves: 0, error: '' };
   try {
@@ -37,7 +39,7 @@ async function syncOnce(username: string) {
     return { newSolves, error: sessionError };
   } catch (error) { const message = errorText(error); setKV('lastSyncError', message); return { newSolves: 0, error: message }; }
 }
-export function syncLeetCode(force = false): Promise<{ newSolves: number; error: string }> { const username = getSettings().username.trim(); if (syncPromise) return activeUsername === username ? syncPromise : syncPromise.then(() => syncLeetCode(force)); if (!force && Date.now() - (getKV<number>('lastSyncAt', 0)) < 5 * 60_000) return Promise.resolve({ newSolves: 0, error: '' }); activeUsername = username; syncPromise = syncOnce(username).finally(() => { syncPromise = undefined; activeUsername = ''; }); return syncPromise; }
+export function syncLeetCode(force = false): Promise<{ newSolves: number; error: string }> { const owner = currentOwner(), username = getSettings().username.trim(), active = syncs.get(owner); if (active) return active.username === username ? active.promise : active.promise.then(() => syncLeetCode(force)); if (!force && Date.now() - (getKV<number>('lastSyncAt', 0)) < 5 * 60_000) return Promise.resolve({ newSolves: 0, error: '' }); const promise = syncOnce(username).finally(() => { syncs.delete(owner); }); syncs.set(owner, { username, promise }); return promise; }
 function currentModel() { return buildModel(getProblems(), getSubmissions(), getProfile(), getSettings()); }
 function parseFilters(input: unknown): SearchFilters {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
@@ -55,7 +57,7 @@ function searchFromCache(filters: SearchFilters, newSolves = 0, syncError = '') 
   const previousModel = getKV<ReturnType<typeof currentModel> | null>('lastModel', null);
   const allProblems = getProblems(), problems = getUnsolvedProblems(), submissions = getSubmissions(), profile = getProfile(), settings = getSettings();
   const model = buildModel(allProblems, submissions, profile, settings);
-  db.transaction(() => { db.prepare('DELETE FROM ratings').run(); const stmt = db.prepare('INSERT INTO ratings VALUES(?,?,?,?,?,?,?)'); for (const s of model.skills) stmt.run(s.tag, s.rating, s.confidence, s.attempts, s.failures, +s.weak, model.updatedAt); })();
+  saveRatings(model);
   const changes = model.skills.map(s => ({ tag: s.tag, before: previousModel?.skills.find(x => x.tag === s.tag)?.rating ?? previousModel?.overall ?? s.rating, after: s.rating })).filter(x => x.before !== x.after).sort((a, b) => Math.abs(b.after - b.before) - Math.abs(a.after - a.before)).slice(0, 3);
   setKV('lastModel', model);
   const recommendations = recommend(allProblems, submissions, model, settings, filters, Date.now(), 20, { previous: getRecommendationHistory(settings.username), skipped: getSkipped(settings.username), candidates: new Set(problems.map(p => p.slug)) });
@@ -69,7 +71,7 @@ api.get('/sync/status', (_req, res) => res.json(getSyncStatus()));
 api.post('/catalog/refresh', (_req, res) => {
   if (catalogJob.running) { res.json(catalogJob); return; }
   catalogJob = { running: true, loaded: 0, total: 0, phase: 'catalog', error: '' };
-  void (async () => {
+  waitUntil((async () => {
     try {
       await fetchCatalog((items, total) => { saveProblems(items); catalogJob.loaded += items.length; catalogJob.total = total; });
       catalogJob.total = catalogJob.loaded;
@@ -80,7 +82,7 @@ api.post('/catalog/refresh', (_req, res) => {
     } catch (error) { catalogJob.error = errorText(error); }
     catalogJob.running = false;
     catalogJob.phase = 'done';
-  })();
+  })());
   res.json(catalogJob);
 });
 api.get('/catalog/status', (_req, res) => res.json(catalogJob));
@@ -90,7 +92,7 @@ api.put('/settings', (req, res) => {
   const clean: Settings = { ...prior, username: typeof body.username === 'string' ? body.username.trim().slice(0, 80) : prior.username, useContestRatings: typeof body.useContestRatings === 'boolean' ? body.useContestRatings : prior.useContestRatings, halfLifeDays: Number.isFinite(body.halfLifeDays) ? Math.max(7, Math.min(365, Number(body.halfLifeDays))) : prior.halfLifeDays, planSize: Number.isFinite(body.planSize) ? Math.max(1, Math.min(12, Number(body.planSize))) : prior.planSize, weights: { ...prior.weights }, hasSession: prior.hasSession };
   for (const key of Object.keys(prior.weights) as (keyof Settings['weights'])[]) if (Number.isFinite(body.weights?.[key])) clean.weights[key] = Math.max(0, Math.min(8, Number(body.weights![key])));
   const changedAccount = clean.username !== prior.username;
-  if (changedAccount) { switchAccount(prior, clean); if (clean.username) void syncLeetCode(); }
+  if (changedAccount) { switchAccount(prior, clean); if (clean.username) waitUntil(syncLeetCode()); }
   else setKV('settings', { ...clean, hasSession: undefined });
   res.json(getSettings());
 });
@@ -98,8 +100,8 @@ api.post('/session', (req, res) => {
   const value = String(req.body?.session ?? '').trim();
   if (value && !/^[A-Za-z0-9_\-.%]+$/.test(value)) { res.status(400).json({ error: 'Invalid cookie format' }); return; }
   setKV('encryptedSession', value ? encrypt(value) : '');
-  if (value && getSettings().username) void syncLeetCode();
-  res.json({ hasSession: !!value || !!process.env.LEETCODE_SESSION });
+  if (value && getSettings().username) waitUntil(syncLeetCode());
+  res.json({ hasSession: !!value || (!multiUser && !!process.env.LEETCODE_SESSION) });
 });
 api.post('/feedback', (req, res) => {
   const { slug, action, attempts, hints, minutes } = (req.body ?? {}) as { slug: string; action: string; attempts?: number; hints?: boolean; minutes?: number };
@@ -115,4 +117,4 @@ api.post('/import', (req, res) => {
   const submissions: Submission[] = slugs.filter((s: unknown): s is string => typeof s === 'string' && valid.has(s)).map((slug: string) => ({ id: `import:${slug}`, slug, timestamp: Date.now(), status: 'accepted', attempts: 1, source: 'import' }));
   res.json({ imported: saveSubmissions(submissions), ignored: slugs.length - submissions.length });
 });
-api.get('/export', (_req, res) => { res.setHeader('Content-Disposition', 'attachment; filename="rickyleet-export.json"'); res.json({ profile: getProfile(), settings: getSettings(), submissions: getSubmissions(), lists: db.prepare('SELECT lists.name, list_items.slug FROM list_items JOIN lists ON lists.id=list_items.list_id').all() }); });
+api.get('/export', (_req, res) => { res.setHeader('Content-Disposition', 'attachment; filename="rickyleet-export.json"'); res.json({ profile: getProfile(), settings: getSettings(), submissions: getSubmissions(), lists: getLegacyLists() }); });

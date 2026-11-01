@@ -1,0 +1,7 @@
+data/
+dist/
+frontend/
+backend/
+node_modules/
+.env
+CHAT_CONTEXT.md

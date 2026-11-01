@@ -1,49 +1,76 @@
 import Database from 'better-sqlite3';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
+import { currentOwner, LOCAL_OWNER, multiUser } from '../context.js';
 import type { Problem, Profile, Settings, Submission } from '../../shared/types.js';
 
-const path = resolve(process.env.DATABASE_PATH || './data/rickyleet.sqlite');
+export const databasePath = resolve(process.env.DATABASE_PATH || (process.env.VERCEL ? '/tmp/rickyleet.sqlite' : './data/rickyleet.sqlite'));
+const path = databasePath;
 mkdirSync(dirname(path), { recursive: true });
 export const db = new Database(path);
 db.pragma('journal_mode = WAL');
+
+// Migrate single-user databases: per-user rows move to the local owner.
+const columns = (table: string) => (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(c => c.name);
+db.transaction(() => {
+  if (columns('submissions').length && !columns('submissions').includes('owner')) {
+    db.exec('ALTER TABLE submissions RENAME TO submissions_single_user; DROP INDEX IF EXISTS idx_submissions_slug_time;');
+    db.exec(`CREATE TABLE submissions (owner TEXT NOT NULL, id TEXT NOT NULL, slug TEXT, timestamp INTEGER, status TEXT, attempts INTEGER, runtime TEXT, source TEXT, hints INTEGER, minutes REAL, PRIMARY KEY(owner,id));
+      INSERT INTO submissions SELECT '${LOCAL_OWNER}',id,slug,timestamp,status,attempts,runtime,source,hints,minutes FROM submissions_single_user;
+      DROP TABLE submissions_single_user;`);
+  }
+  if (columns('ratings').length && !columns('ratings').includes('owner')) db.exec('DROP TABLE ratings');
+  if (columns('kv').length && !db.prepare("SELECT 1 FROM kv WHERE key='meta:multiUser'").get()) {
+    db.prepare("UPDATE kv SET key='u:' || ? || ':' || key WHERE key NOT LIKE 'u:%' AND key NOT LIKE 'meta:%'").run(LOCAL_OWNER);
+    for (const table of ['recommendation_history', 'recommendation_skips']) if (columns(table).length) db.prepare(`UPDATE ${table} SET account=? || ':' || account WHERE instr(account, ':')=0`).run(LOCAL_OWNER);
+    db.prepare("INSERT INTO kv(key,value) VALUES('meta:multiUser','1')").run();
+  }
+})();
+
 db.exec(`CREATE TABLE IF NOT EXISTS problems (slug TEXT PRIMARY KEY, id TEXT, title TEXT, difficulty TEXT, acceptance REAL, tags TEXT, paid INTEGER, likes INTEGER, dislikes INTEGER, rating REAL, companyTags TEXT, createdAt TEXT);
 CREATE INDEX IF NOT EXISTS idx_problems_id ON problems(id);
 CREATE INDEX IF NOT EXISTS idx_problems_difficulty ON problems(difficulty);
-CREATE TABLE IF NOT EXISTS submissions (id TEXT PRIMARY KEY, slug TEXT, timestamp INTEGER, status TEXT, attempts INTEGER, runtime TEXT, source TEXT, hints INTEGER, minutes REAL);
-CREATE INDEX IF NOT EXISTS idx_submissions_slug_time ON submissions(slug,timestamp);
+CREATE TABLE IF NOT EXISTS submissions (owner TEXT NOT NULL, id TEXT NOT NULL, slug TEXT, timestamp INTEGER, status TEXT, attempts INTEGER, runtime TEXT, source TEXT, hints INTEGER, minutes REAL, PRIMARY KEY(owner,id));
+CREATE INDEX IF NOT EXISTS idx_submissions_owner_slug_time ON submissions(owner,slug,timestamp);
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
+INSERT OR IGNORE INTO kv(key,value) VALUES('meta:multiUser','1');
 CREATE TABLE IF NOT EXISTS lists (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL);
 CREATE TABLE IF NOT EXISTS list_items (list_id INTEGER, slug TEXT, PRIMARY KEY(list_id,slug));
-CREATE TABLE IF NOT EXISTS ratings (tag TEXT PRIMARY KEY, rating REAL, confidence REAL, attempts INTEGER, failures INTEGER, weak INTEGER, updated_at INTEGER);
+CREATE TABLE IF NOT EXISTS ratings (owner TEXT NOT NULL, tag TEXT NOT NULL, rating REAL, confidence REAL, attempts INTEGER, failures INTEGER, weak INTEGER, updated_at INTEGER, PRIMARY KEY(owner,tag));
 CREATE TABLE IF NOT EXISTS recommendation_history (account TEXT NOT NULL, slug TEXT NOT NULL, shown_at INTEGER NOT NULL, position INTEGER NOT NULL, PRIMARY KEY(account,slug));
 CREATE INDEX IF NOT EXISTS idx_recommendation_history_account_time ON recommendation_history(account,shown_at);
 CREATE TABLE IF NOT EXISTS recommendation_skips (account TEXT NOT NULL, slug TEXT NOT NULL, skipped_at INTEGER NOT NULL, PRIMARY KEY(account,slug));
 CREATE INDEX IF NOT EXISTS idx_recommendation_skips_account_time ON recommendation_skips(account,skipped_at);`);
 const defaults: Settings = { username: '', useContestRatings: false, halfLifeDays: 90, weights: { targetFit: 4, weakness: 2, exploration: 1.5, quality: 1, diversity: 1.5, fatigue: 1 }, planSize: 4, hasSession: false };
-export function getKV<T>(key: string, fallback: T): T { const row = db.prepare('SELECT value FROM kv WHERE key=?').get(key) as { value: string } | undefined; try { return row ? JSON.parse(row.value) as T : fallback; } catch { return fallback; } }
-export function setKV(key: string, value: unknown) { db.prepare('INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, JSON.stringify(value)); }
-export function getSettings(): Settings { return { ...defaults, ...getKV<Partial<Settings>>('settings', {}), weights: { ...defaults.weights, ...getKV<Partial<Settings>>('settings', {}).weights }, hasSession: !!process.env.LEETCODE_SESSION || !!getKV<string>('encryptedSession', '') }; }
+// Per-user keys and recommendation accounts are prefixed with the current owner.
+const scopedKey = (key: string) => `u:${currentOwner()}:${key}`;
+const scopedAccount = (account: string) => `${currentOwner()}:${account}`;
+export function getKV<T>(key: string, fallback: T): T { const row = db.prepare('SELECT value FROM kv WHERE key=?').get(scopedKey(key)) as { value: string } | undefined; try { return row ? JSON.parse(row.value) as T : fallback; } catch { return fallback; } }
+export function setKV(key: string, value: unknown) { db.prepare('INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(scopedKey(key), JSON.stringify(value)); }
+export function getSettings(): Settings { return { ...defaults, ...getKV<Partial<Settings>>('settings', {}), weights: { ...defaults.weights, ...getKV<Partial<Settings>>('settings', {}).weights }, hasSession: (!multiUser && !!process.env.LEETCODE_SESSION) || !!getKV<string>('encryptedSession', '') }; }
 export function saveProblems(items: Problem[]) { const insert = db.prepare('INSERT INTO problems(slug,id,title,difficulty,acceptance,tags,paid,likes,dislikes,rating,companyTags,createdAt) VALUES(@slug,@id,@title,@difficulty,@acceptance,@tags,@paid,@likes,@dislikes,@rating,@companyTags,@createdAt) ON CONFLICT(slug) DO UPDATE SET id=excluded.id,title=excluded.title,difficulty=excluded.difficulty,acceptance=excluded.acceptance,tags=excluded.tags,paid=excluded.paid,likes=CASE WHEN excluded.likes=0 AND excluded.dislikes=0 THEN problems.likes ELSE excluded.likes END,dislikes=CASE WHEN excluded.likes=0 AND excluded.dislikes=0 THEN problems.dislikes ELSE excluded.dislikes END,companyTags=excluded.companyTags'); db.transaction(() => { for (const p of items) insert.run({ ...p, tags: JSON.stringify(p.tags), paid: +p.paid, rating: p.rating ?? null, companyTags: JSON.stringify(p.companyTags ?? []), createdAt: p.createdAt ?? new Date().toISOString() }); })(); }
 export function getProblems(): Problem[] { return (db.prepare('SELECT * FROM problems').all() as any[]).map(p => ({ ...p, tags: JSON.parse(p.tags), companyTags: JSON.parse(p.companyTags || '[]'), paid: !!p.paid, rating: p.rating ?? undefined })); }
-export function saveSubmissions(items: Submission[]): number { const stmt = db.prepare('INSERT OR IGNORE INTO submissions(id,slug,timestamp,status,attempts,runtime,source,hints,minutes) VALUES(@id,@slug,@timestamp,@status,@attempts,@runtime,@source,@hints,@minutes)'); let count = 0; db.transaction(() => { for (const s of items) count += stmt.run({ ...s, runtime: s.runtime ?? null, hints: +(s.hints ?? false), minutes: s.minutes ?? null }).changes; })(); return count; }
-export function getSubmissions(): Submission[] { return (db.prepare('SELECT * FROM submissions ORDER BY timestamp').all() as any[]).map(s => ({ ...s, hints: !!s.hints })); }
+export function saveSubmissions(items: Submission[]): number { const stmt = db.prepare('INSERT OR IGNORE INTO submissions(owner,id,slug,timestamp,status,attempts,runtime,source,hints,minutes) VALUES(@owner,@id,@slug,@timestamp,@status,@attempts,@runtime,@source,@hints,@minutes)'); const owner = currentOwner(); let count = 0; db.transaction(() => { for (const s of items) count += stmt.run({ ...s, owner, runtime: s.runtime ?? null, hints: +(s.hints ?? false), minutes: s.minutes ?? null }).changes; })(); return count; }
+export function getSubmissions(): Submission[] { return (db.prepare('SELECT id,slug,timestamp,status,attempts,runtime,source,hints,minutes FROM submissions WHERE owner=? ORDER BY timestamp').all(currentOwner()) as any[]).map(s => ({ ...s, hints: !!s.hints })); }
 export function getProfile(): Profile { return getKV<Profile>('profile', { username: getSettings().username, solved: { Easy: 0, Medium: 0, Hard: 0 }, tagStats: {} }); }
-export function getVerifiedSolved(): Set<string> { return new Set((db.prepare("SELECT DISTINCT slug FROM submissions WHERE status='accepted'").all() as { slug: string }[]).map(row => row.slug)); }
-export function getUnsolvedProblems(): Problem[] { const solved = new Set((db.prepare("SELECT DISTINCT p.id FROM submissions s JOIN problems p ON p.slug=s.slug WHERE s.status='accepted' AND p.id IS NOT NULL").all() as { id: string }[]).map(row => row.id)); return getProblems().filter(p => !solved.has(p.id)); }
-export function getRecommendationHistory(account: string): Map<string, { shownAt: number; position: number }> { return new Map((db.prepare('SELECT slug,shown_at,position FROM recommendation_history WHERE account=?').all(account) as { slug: string; shown_at: number; position: number }[]).map(row => [row.slug, { shownAt: row.shown_at, position: row.position }])); }
-export function getSkipped(account: string): Map<string, number> { return new Map((db.prepare('SELECT slug,skipped_at FROM recommendation_skips WHERE account=?').all(account) as { slug: string; skipped_at: number }[]).map(row => [row.slug, row.skipped_at])); }
-export function recordRecommendations(account: string, slugs: string[]) { if (!account) return; const statement = db.prepare('INSERT INTO recommendation_history(account,slug,shown_at,position) VALUES(?,?,?,?) ON CONFLICT(account,slug) DO UPDATE SET shown_at=excluded.shown_at,position=excluded.position'); const now = Date.now(); db.transaction(() => { slugs.forEach((slug, position) => statement.run(account, slug, now, position)); })(); }
-export function skipRecommendation(account: string, slug: string) { db.prepare('INSERT INTO recommendation_skips(account,slug,skipped_at) VALUES(?,?,?) ON CONFLICT(account,slug) DO UPDATE SET skipped_at=excluded.skipped_at').run(account, slug, Date.now()); }
+export function getVerifiedSolved(): Set<string> { return new Set((db.prepare("SELECT DISTINCT slug FROM submissions WHERE owner=? AND status='accepted'").all(currentOwner()) as { slug: string }[]).map(row => row.slug)); }
+export function getUnsolvedProblems(): Problem[] { const solved = new Set((db.prepare("SELECT DISTINCT p.id FROM submissions s JOIN problems p ON p.slug=s.slug WHERE s.owner=? AND s.status='accepted' AND p.id IS NOT NULL").all(currentOwner()) as { id: string }[]).map(row => row.id)); return getProblems().filter(p => !solved.has(p.id)); }
+export function getRecommendationHistory(account: string): Map<string, { shownAt: number; position: number }> { return new Map((db.prepare('SELECT slug,shown_at,position FROM recommendation_history WHERE account=?').all(scopedAccount(account)) as { slug: string; shown_at: number; position: number }[]).map(row => [row.slug, { shownAt: row.shown_at, position: row.position }])); }
+export function getSkipped(account: string): Map<string, number> { return new Map((db.prepare('SELECT slug,skipped_at FROM recommendation_skips WHERE account=?').all(scopedAccount(account)) as { slug: string; skipped_at: number }[]).map(row => [row.slug, row.skipped_at])); }
+export function recordRecommendations(account: string, slugs: string[]) { if (!account) return; const statement = db.prepare('INSERT INTO recommendation_history(account,slug,shown_at,position) VALUES(?,?,?,?) ON CONFLICT(account,slug) DO UPDATE SET shown_at=excluded.shown_at,position=excluded.position'); const now = Date.now(), key = scopedAccount(account); db.transaction(() => { slugs.forEach((slug, position) => statement.run(key, slug, now, position)); })(); }
+export function skipRecommendation(account: string, slug: string) { db.prepare('INSERT INTO recommendation_skips(account,slug,skipped_at) VALUES(?,?,?) ON CONFLICT(account,slug) DO UPDATE SET skipped_at=excluded.skipped_at').run(scopedAccount(account), slug, Date.now()); }
 export function switchAccount(prior: Settings, next: Settings) {
   db.transaction(() => {
     if (prior.username) setKV(`account:${prior.username}`, { profile: getProfile(), submissions: getSubmissions(), lastSyncAt: getKV<number | undefined>('lastSyncAt', undefined), lastSyncError: getKV<string>('lastSyncError', '') });
     const saved = getKV<{ profile: Profile; submissions: Submission[]; lastSyncAt?: number; lastSyncError?: string } | null>(`account:${next.username}`, null);
-    db.prepare('DELETE FROM submissions').run();
-    db.prepare('DELETE FROM ratings').run();
-    db.prepare("DELETE FROM kv WHERE key IN ('lastModel','lastSyncAt','lastSyncError','lastSyncNewSolves','encryptedSession')").run();
+    db.prepare('DELETE FROM submissions WHERE owner=?').run(currentOwner());
+    db.prepare('DELETE FROM ratings WHERE owner=?').run(currentOwner());
+    for (const key of ['lastModel', 'lastSyncAt', 'lastSyncError', 'lastSyncNewSolves', 'encryptedSession']) db.prepare('DELETE FROM kv WHERE key=?').run(scopedKey(key));
     setKV('settings', { ...next, hasSession: undefined });
     if (saved) { saveSubmissions(saved.submissions); setKV('profile', saved.profile); if (saved.lastSyncAt) setKV('lastSyncAt', saved.lastSyncAt); if (saved.lastSyncError) setKV('lastSyncError', saved.lastSyncError); }
     else setKV('profile', { username: next.username, solved: { Easy: 0, Medium: 0, Hard: 0 }, tagStats: {} });
   })();
 }
+export function saveRatings(model: { skills: { tag: string; rating: number; confidence: number; attempts: number; failures: number; weak: boolean }[]; updatedAt: number }) { const owner = currentOwner(); db.transaction(() => { db.prepare('DELETE FROM ratings WHERE owner=?').run(owner); const stmt = db.prepare('INSERT INTO ratings VALUES(?,?,?,?,?,?,?,?)'); for (const s of model.skills) stmt.run(owner, s.tag, s.rating, s.confidence, s.attempts, s.failures, +s.weak, model.updatedAt); })(); }
+// Saved lists predate per-user data, so only the local owner sees them.
+export function getLegacyLists() { return multiUser && currentOwner() !== LOCAL_OWNER ? [] : db.prepare('SELECT lists.name, list_items.slug FROM list_items JOIN lists ON lists.id=list_items.list_id').all(); }

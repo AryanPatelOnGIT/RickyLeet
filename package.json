@@ -11,6 +11,7 @@
     "seed": "tsx server/db/seed.ts"
   },
   "dependencies": {
+    "@vercel/functions": "^3.10.5",
     "better-sqlite3": "^12.4.1",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
@@ -33,5 +34,8 @@
     "typescript": "^5.9.3",
     "vite": "^7.1.9",
     "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": "24.x"
   }
 }

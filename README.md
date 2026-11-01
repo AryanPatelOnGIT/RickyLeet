@@ -19,6 +19,8 @@ The Express adapter requests public profile totals, topic counts, contest rating
 
 For more complete history, paste a `LEETCODE_SESSION` value in Settings or set it in `.env`. The local server stores a pasted cookie encrypted with a local key and never returns it to the browser. The optional history request retrieves pages of submissions incrementally, up to 4,000 events per sync. You can also import solved slugs from a JSON array, `{ "slugs": ["two-sum"] }`, or a CSV `slug` column. Imported slugs must already exist in the cached catalog. Manual **Solved** actions are verified locally and immediately leave the unsolved feed.
 
+When hosted (`MULTI_USER=true`, enabled automatically on Vercel), every browser gets an anonymous `rl_uid` cookie and its own settings, LeetCode username, solves, skips, and session cookie. The problem catalog is shared. The server's `LEETCODE_SESSION` variable is ignored in this mode so visitors never use the owner's cookie. Locally, all data belongs to a single user, and an older single-user database is migrated in place on first start.
+
 The SQLite file and session key live under `data/` by default. Set `DATABASE_PATH` to choose a different location. Do not publish `.env`, `data/`, or the session key.
 
 ## Recommendation algorithm
