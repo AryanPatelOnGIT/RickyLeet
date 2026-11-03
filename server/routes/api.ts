@@ -16,22 +16,22 @@ const secretPath = resolve(dirname(databasePath), 'session.key');
 function sessionKey() { mkdirSync(dirname(secretPath), { recursive: true }); if (!existsSync(secretPath)) writeFileSync(secretPath, randomBytes(32), { mode: 0o600 }); return readFileSync(secretPath); }
 function encrypt(value: string) { const iv = randomBytes(12); const cipher = createCipheriv('aes-256-gcm', sessionKey(), iv); const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]); return Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString('base64'); }
 function decrypt(value: string) { const raw = Buffer.from(value, 'base64'); const decipher = createDecipheriv('aes-256-gcm', sessionKey(), raw.subarray(0, 12)); decipher.setAuthTag(raw.subarray(12, 28)); return Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString('utf8'); }
-// Session cookies grant account access, so only a local single-user server uses them. Hosted visitors rely on public data and imports.
+// Session cookies grant account access, so only a local single-user server stores one. A hosted visitor's cookie is used for one import and discarded.
 function getSession() { if (multiUser) return ''; const encrypted = getKV<string>('encryptedSession', ''); try { return process.env.LEETCODE_SESSION || (encrypted ? decrypt(encrypted) : ''); } catch { return ''; } }
 const localOnly = (feature: string) => ({ error: `${feature} only works when RickyLeet runs on your own computer.` });
 // In-flight syncs are tracked per owner so one visitor never waits on (or reuses) another's sync.
 const syncs = new Map<string, { username: string; promise: Promise<{ newSolves: number; error: string }> }>();
 export function getSyncStatus(): SyncStatus { const reported = getProfile().solved; const reportedSolved = reported.Easy + reported.Medium + reported.Hard; return { running: syncs.has(currentOwner()), lastSync: getKV<number | undefined>('lastSyncAt', undefined), lastError: getKV<string>('lastSyncError', ''), newSolves: getKV<number>('lastSyncNewSolves', 0), verifiedSolved: getVerifiedSolved().size, reportedSolved }; }
-async function syncOnce(username: string) {
+async function syncOnce(username: string, oneTimeSession = '') {
   if (!username) return { newSolves: 0, error: '' };
   try {
     const { profile, recent } = await fetchProfileSnapshot(username);
     if (getSettings().username !== username) return { newSolves: 0, error: 'Profile changed during sync' };
     setKV('profile', profile);
     let incoming = recent;
-    const session = getSession();
+    const session = oneTimeSession || getSession();
     let sessionError = '';
-    if (session) { try { incoming = [...recent, ...await fetchFullHistory(session, new Set(getSubmissions().filter(s => s.source === 'session').map(s => s.id)), 40, username)]; } catch { sessionError = 'Full history unavailable or session account differs; saved solves were retained.'; } }
+    if (session) { try { incoming = [...recent, ...await fetchFullHistory(session, new Set(getSubmissions().filter(s => s.source === 'session').map(s => s.id)), 40, username)]; } catch (error) { sessionError = `Full history unavailable: ${errorText(error)}. Saved solves were retained.`; } }
     if (getSettings().username !== username) return { newSolves: 0, error: 'Profile changed during sync' };
     const before = new Set(getSubmissions().filter(s => s.status === 'accepted').map(s => s.slug));
     saveSubmissions(incoming);
@@ -41,7 +41,7 @@ async function syncOnce(username: string) {
     return { newSolves, error: sessionError };
   } catch (error) { const message = errorText(error); setKV('lastSyncError', message); return { newSolves: 0, error: message }; }
 }
-export function syncLeetCode(force = false): Promise<{ newSolves: number; error: string }> { const owner = currentOwner(), username = getSettings().username.trim(), active = syncs.get(owner); if (active) return active.username === username ? active.promise : active.promise.then(() => syncLeetCode(force)); if (!force && Date.now() - (getKV<number>('lastSyncAt', 0)) < 5 * 60_000) return Promise.resolve({ newSolves: 0, error: '' }); const promise = syncOnce(username).finally(() => { syncs.delete(owner); }); syncs.set(owner, { username, promise }); return promise; }
+export function syncLeetCode(force = false, oneTimeSession = ''): Promise<{ newSolves: number; error: string }> { const owner = currentOwner(), username = getSettings().username.trim(), active = syncs.get(owner); if (active) return active.username === username && !oneTimeSession ? active.promise : active.promise.then(() => syncLeetCode(force, oneTimeSession)); if (!force && Date.now() - (getKV<number>('lastSyncAt', 0)) < 5 * 60_000) return Promise.resolve({ newSolves: 0, error: '' }); const promise = syncOnce(username, oneTimeSession).finally(() => { syncs.delete(owner); }); syncs.set(owner, { username, promise }); return promise; }
 function currentModel() { return buildModel(getProblems(), getSubmissions(), getProfile(), getSettings()); }
 function parseFilters(input: unknown): SearchFilters {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
@@ -102,13 +102,15 @@ api.put('/settings', (req, res) => {
   else setKV('settings', { ...clean, hasSession: undefined });
   res.json(getSettings());
 });
-api.post('/session', (req, res) => {
-  if (multiUser) { res.status(403).json(localOnly('Saving a LeetCode session cookie')); return; }
+// Locally the cookie is stored encrypted for later syncs. Hosted, it is used for this one import and then
+// discarded: it is never written to the database, returned, or kept in the visitor's browser.
+api.post('/session', async (req, res) => {
   const value = String(req.body?.session ?? '').trim();
   if (value && !/^[A-Za-z0-9_\-.%]+$/.test(value)) { res.status(400).json({ error: 'Invalid cookie format' }); return; }
-  setKV('encryptedSession', value ? encrypt(value) : '');
-  if (value && getSettings().username) waitUntil(syncLeetCode());
-  res.json({ hasSession: !!value || (!multiUser && !!process.env.LEETCODE_SESSION) });
+  if (!multiUser) setKV('encryptedSession', value ? encrypt(value) : '');
+  if (!value || !getSettings().username) { if (value && multiUser) res.status(400).json({ error: 'Save your LeetCode username first.' }); else res.json({ hasSession: getSettings().hasSession }); return; }
+  const result = await syncLeetCode(true, multiUser ? value : '');
+  res.status(result.error ? 400 : 200).json({ hasSession: getSettings().hasSession, newSolves: result.newSolves, ...(result.error ? { error: result.error } : {}), syncStatus: getSyncStatus() });
 });
 api.post('/feedback', (req, res) => {
   const { slug, action, attempts, hints, minutes } = (req.body ?? {}) as { slug: string; action: string; attempts?: number; hints?: boolean; minutes?: number };

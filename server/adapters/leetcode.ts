@@ -4,23 +4,20 @@ const endpoint = 'https://leetcode.com/graphql/';
 class PermanentLeetCodeError extends Error {}
 let lastRequest = 0;
 let queue = Promise.resolve();
-let csrfToken = '';
-let csrfSession = '';
-async function prepareSession(session: string) {
-  if (csrfSession === session) return;
-  csrfToken = '';
+// Each sync carries its own cookie and CSRF token, so concurrent visitors never share credentials.
+type Auth = { session: string; csrf: string };
+async function authFor(session: string): Promise<Auth> {
   await throttle();
   const response = await fetch('https://leetcode.com/', { headers: { cookie: `LEETCODE_SESSION=${session}` }, signal: AbortSignal.timeout(20000) });
   const cookies = response.headers.getSetCookie?.() ?? [response.headers.get('set-cookie') ?? ''];
-  csrfToken = cookies.map(c => /(?:^|;\s*)csrftoken=([^;]+)/.exec(c)?.[1]).find(Boolean) ?? '';
-  csrfSession = session;
+  return { session, csrf: cookies.map(c => /(?:^|;\s*)csrftoken=([^;]+)/.exec(c)?.[1]).find(Boolean) ?? '' };
 }
 async function throttle() { const task = queue.then(async () => { const delay = Math.max(0, 1050 - (Date.now() - lastRequest)); if (delay) await new Promise(resolve => setTimeout(resolve, delay)); lastRequest = Date.now(); }); queue = task.catch(() => {}); await task; }
-async function gql<T>(query: string, variables: Record<string, unknown> = {}, session?: string): Promise<T> {
+async function gql<T>(query: string, variables: Record<string, unknown> = {}, auth?: Auth): Promise<T> {
   for (let attempt = 0; attempt < 4; attempt++) {
     await throttle();
     try {
-      const response = await fetch(endpoint, { method: 'POST', headers: { 'content-type': 'application/json', 'referer': 'https://leetcode.com/', 'origin': 'https://leetcode.com', ...(session ? { cookie: `LEETCODE_SESSION=${session}${csrfToken ? `; csrftoken=${csrfToken}` : ''}`, ...(csrfToken ? { 'x-csrftoken': csrfToken } : {}) } : {}) }, body: JSON.stringify({ query, variables }), signal: AbortSignal.timeout(20000) });
+      const response = await fetch(endpoint, { method: 'POST', headers: { 'content-type': 'application/json', 'referer': 'https://leetcode.com/', 'origin': 'https://leetcode.com', ...(auth ? { cookie: `LEETCODE_SESSION=${auth.session}${auth.csrf ? `; csrftoken=${auth.csrf}` : ''}`, ...(auth.csrf ? { 'x-csrftoken': auth.csrf } : {}) } : {}) }, body: JSON.stringify({ query, variables }), signal: AbortSignal.timeout(20000) });
       if (response.status === 429 || response.status >= 500) throw new Error(`LeetCode HTTP ${response.status}`);
       if (!response.ok) throw new PermanentLeetCodeError(`LeetCode HTTP ${response.status}`);
       const payload = await response.json() as { data?: T; errors?: { message: string }[] };
@@ -80,15 +77,22 @@ export async function fetchProfileSnapshot(username: string): Promise<{ profile:
 }
 export async function fetchProfile(username: string): Promise<Profile> { return (await fetchProfileSnapshot(username)).profile; }
 
+// Returns the session owner's submission history (`session:` ids) plus one `solved:<slug>` entry for
+// every problem LeetCode lists as solved. Public data stops at 20 recent accepts; the solved list does not.
 export async function fetchFullHistory(session: string, knownIds = new Set<string>(), maxPages = 40, expectedUsername = ''): Promise<Submission[]> {
-  await prepareSession(session);
-  const owner = await gql<{ userStatus?: { username?: string } }>('query sessionOwner { userStatus { username } }', {}, session);
+  const auth = await authFor(session);
+  const owner = await gql<{ userStatus?: { username?: string } }>('query sessionOwner { userStatus { username } }', {}, auth);
   if (!owner.userStatus?.username) throw new Error('Session is expired or invalid');
   if (expectedUsername && owner.userStatus.username.toLowerCase() !== expectedUsername.toLowerCase()) throw new Error('Session belongs to another LeetCode account');
+  const [history, solved] = await Promise.allSettled([fetchSubmissionPages(auth, knownIds, maxPages), fetchSolvedList(auth)]);
+  if (history.status === 'rejected' && solved.status === 'rejected') throw history.reason;
+  return [...(history.status === 'fulfilled' ? history.value : []), ...(solved.status === 'fulfilled' ? solved.value : [])];
+}
+async function fetchSubmissionPages(auth: Auth, knownIds: Set<string>, maxPages: number): Promise<Submission[]> {
   const query = `query history($offset: Int!, $limit: Int!) { submissionList(offset: $offset, limit: $limit) { hasNext submissions { id titleSlug statusDisplay timestamp runtime } } }`;
   const all: Submission[] = [];
   for (let page = 0; page < maxPages; page++) {
-    const data = await gql<{ submissionList: { hasNext: boolean; submissions: { id: string; titleSlug: string; statusDisplay: string; timestamp: string; runtime?: string }[] } }>(query, { offset: page * 100, limit: 100 }, session);
+    const data = await gql<{ submissionList: { hasNext: boolean; submissions: { id: string; titleSlug: string; statusDisplay: string; timestamp: string; runtime?: string }[] } }>(query, { offset: page * 100, limit: 100 }, auth);
     const list = data.submissionList?.submissions ?? [];
     all.push(...list.map(s => ({ id: `session:${s.id}`, slug: s.titleSlug, timestamp: Number(s.timestamp) * 1000, status: s.statusDisplay === 'Accepted' ? 'accepted' as const : 'failed' as const, attempts: 1, runtime: s.runtime, source: 'session' as const })));
     if (list.some(s => knownIds.has(`session:${s.id}`))) break;
@@ -100,4 +104,18 @@ export async function fetchFullHistory(session: string, knownIds = new Set<strin
     else failed.set(item.slug, (failed.get(item.slug) ?? 0) + 1);
   }
   return all;
+}
+// The list behind leetcode.com/progress. lastSubmittedAt may be epoch seconds or an ISO date.
+async function fetchSolvedList(auth: Auth): Promise<Submission[]> {
+  const query = `query solved($filters: UserProgressQuestionListInput) { userProgressQuestionList(filters: $filters) { totalNum questions { titleSlug lastSubmittedAt } } }`;
+  const time = (value: unknown) => { const n = typeof value === 'number' ? (value < 1e12 ? value * 1000 : value) : Date.parse(String(value)); return Number.isFinite(n) ? n : 0; };
+  const solved: Submission[] = [];
+  for (let skip = 0; skip < 20000;) {
+    const data = await gql<{ userProgressQuestionList: { totalNum: number; questions: { titleSlug: string; lastSubmittedAt?: unknown }[] } | null }>(query, { filters: { skip, limit: 100, questionStatus: 'SOLVED' } }, auth);
+    const page = data.userProgressQuestionList?.questions ?? [];
+    solved.push(...page.map(q => ({ id: `solved:${q.titleSlug}`, slug: q.titleSlug, timestamp: time(q.lastSubmittedAt), status: 'accepted' as const, attempts: 1, source: 'session' as const })));
+    skip += page.length;
+    if (!page.length || skip >= (data.userProgressQuestionList?.totalNum ?? 0)) break;
+  }
+  return solved;
 }

@@ -52,6 +52,14 @@ describe('SQLite progress', () => {
       expect(store.getSubmissions().map(s => [s.id, s.attempts])).toEqual([['session:77', 3]]);
     });
   });
+  it('keeps solved-list entries only for problems no real accept identifies', () => {
+    runAsOwner('stand-ins', () => {
+      store.saveSubmissions([{ ...accepted, id: 'solved:two-sum', source: 'session' }, { ...accepted, id: 'solved:array-next', slug: 'array-next', source: 'session' }]);
+      store.saveSubmissions([{ ...accepted, id: 'feedback:1', source: 'feedback' }]);
+      expect(store.getSubmissions().map(s => s.id).sort()).toEqual(['feedback:1', 'solved:array-next']);
+      expect(store.getVerifiedSolved()).toEqual(new Set(['two-sum', 'array-next']));
+    });
+  });
   it('round-trips a visitor\'s data and leaves nothing behind', () => {
     const state = runAsOwner('visitor:a', () => {
       store.setKV('settings', { ...store.getSettings(), username: 'carol' });

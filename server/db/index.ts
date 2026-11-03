@@ -57,6 +57,8 @@ export const problemCount = () => (db.prepare('SELECT COUNT(*) AS n FROM problem
 export function saveSubmissions(items: Submission[]): number {
   const stmt = db.prepare('INSERT OR IGNORE INTO submissions(owner,id,slug,timestamp,status,attempts,runtime,source,hints,minutes) VALUES(@owner,@id,@slug,@timestamp,@status,@attempts,@runtime,@source,@hints,@minutes)');
   const exists = db.prepare('SELECT 1 FROM submissions WHERE owner=? AND id=?'), remove = db.prepare('DELETE FROM submissions WHERE owner=? AND id=?');
+  // A `solved:<slug>` entry from LeetCode's solved list only stands in for a problem no real accepted submission identifies.
+  const removeStandIns = db.prepare("DELETE FROM submissions WHERE owner=? AND id LIKE 'solved:%' AND EXISTS (SELECT 1 FROM submissions s WHERE s.owner=submissions.owner AND s.slug=submissions.slug AND s.status='accepted' AND s.id NOT LIKE 'solved:%')");
   const owner = currentOwner(); let count = 0;
   db.transaction(() => {
     for (const s of items) {
@@ -64,6 +66,7 @@ export function saveSubmissions(items: Submission[]): number {
       count += stmt.run({ ...s, owner, runtime: s.runtime ?? null, hints: +(s.hints ?? false), minutes: s.minutes ?? null }).changes;
       if (s.id.startsWith('session:')) remove.run(owner, `public:${s.id.slice(8)}`);
     }
+    if (items.some(s => s.status === 'accepted')) removeStandIns.run(owner);
   })();
   return count;
 }

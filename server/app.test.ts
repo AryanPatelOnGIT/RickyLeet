@@ -5,7 +5,9 @@ import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 
-vi.mock('./adapters/leetcode.js', () => ({ fetchProfileSnapshot: vi.fn().mockRejectedValue(new Error('offline')) }));
+const leetcode = vi.hoisted(() => ({ fetchProfileSnapshot: vi.fn(), fetchFullHistory: vi.fn() }));
+vi.mock('./adapters/leetcode.js', () => leetcode);
+leetcode.fetchProfileSnapshot.mockRejectedValue(new Error('offline'));
 const folder = mkdtempSync(join(tmpdir(), 'rickyleet-app-test-'));
 process.env.DATABASE_PATH = join(folder, 'test.sqlite');
 process.env.MULTI_USER = 'true';
@@ -72,6 +74,29 @@ it('sanitizes forged visitor data and refuses local-only features', async () => 
   expect(view.syncStatus.verifiedSolved).toBe(1);
   expect(Object.keys(view.visitorState.kv)).toEqual(['settings']);
   const dave = browser();
-  expect((await dave('/session', 'POST', { session: 'abc' })).status).toBe(403);
+  expect((await dave('/session', 'POST', { session: 'abc' })).status).toBe(400);
   expect((await dave('/catalog/refresh', 'POST')).status).toBe(403);
+});
+
+it('identifies every solved problem with a one-time session import and never keeps the cookie', async () => {
+  const now = Date.now(), cookie = 'secret-cookie-value';
+  leetcode.fetchProfileSnapshot.mockResolvedValueOnce({ profile: { username: 'erin', solved: { Easy: 3, Medium: 0, Hard: 0 }, tagStats: {} }, recent: [{ id: 'public:1', slug: 'two-sum', timestamp: now, status: 'accepted', attempts: 1, source: 'public' }] });
+  leetcode.fetchFullHistory.mockResolvedValueOnce([
+    { id: 'session:1', slug: 'two-sum', timestamp: now, status: 'accepted', attempts: 1, source: 'session' },
+    { id: 'solved:two-sum', slug: 'two-sum', timestamp: now, status: 'accepted', attempts: 1, source: 'session' },
+    { id: 'solved:valid-parentheses', slug: 'valid-parentheses', timestamp: 1, status: 'accepted', attempts: 1, source: 'session' },
+    { id: 'solved:climbing-stairs', slug: 'climbing-stairs', timestamp: 1, status: 'accepted', attempts: 1, source: 'session' },
+  ]);
+  const erin = browser();
+  await erin('/settings', 'PUT', { username: 'erin' });
+  const imported = await erin('/session', 'POST', { session: cookie });
+  expect(imported).toMatchObject({ status: 200, hasSession: false, newSolves: 3 });
+  expect(imported.syncStatus).toMatchObject({ verifiedSolved: 3, reportedSolved: 3 });
+  expect(leetcode.fetchFullHistory).toHaveBeenCalledWith(cookie, expect.any(Set), 40, 'erin');
+  // The solved list only fills gaps: two-sum keeps its real submission and no duplicate accept.
+  const state = erin.state() as { submissions: { id: string }[] };
+  expect(state.submissions.map(s => s.id).sort()).toEqual(['session:1', 'solved:climbing-stairs', 'solved:valid-parentheses']);
+  expect(JSON.stringify(state)).not.toContain(cookie);
+  expect(JSON.stringify(store.db.prepare('SELECT * FROM kv').all())).not.toContain(cookie);
+  expect((await erin('/bootstrap')).syncStatus.verifiedSolved).toBe(3);
 });
