@@ -8,7 +8,8 @@
     "dev:web": "vite --config web/vite.config.ts",
     "build": "tsc -p server/tsconfig.json && tsc -p web/tsconfig.json && vite build --config web/vite.config.ts",
     "test": "vitest run",
-    "seed": "tsx server/db/seed.ts"
+    "seed": "tsx server/db/seed.ts",
+    "catalog:snapshot": "tsx server/db/snapshot.ts"
   },
   "dependencies": {
     "@vercel/functions": "^3.10.5",

@@ -8,7 +8,7 @@ A local LeetCode practice coach. It keeps a cached problem catalog and verified 
 2. In this repository, run `npm install`.
 3. Copy `.env.example` to `.env`. Leave `LEETCODE_SESSION` empty unless you choose to use authenticated history.
 4. Run `npm run dev` and open http://localhost:5173. This starts the Express API on `127.0.0.1:3001` and Vite on `localhost:5173`.
-5. Open **Settings**, enter your LeetCode username, and save. Use **Refresh catalog** the first time to download problem metadata. The catalog refresh is throttled and can take several minutes.
+5. Open **Settings**, enter your LeetCode username, and save. A new database starts from the bundled catalog snapshot; use **Refresh catalog** to download current problem metadata. The catalog refresh is throttled and can take several minutes.
 6. Use **Sync** to force a profile update. RickyLeet also checks on startup and when refreshing recommendations, with a five minute sync cache to avoid duplicate calls.
 
 `npm test` runs the engine, storage, and failure tests. `npm run build` type checks both apps and builds the frontend. There is no lint script in this repository.
@@ -17,9 +17,13 @@ A local LeetCode practice coach. It keeps a cached problem catalog and verified 
 
 The Express adapter requests public profile totals, topic counts, contest rating, and up to 20 recent accepted submissions in one GraphQL request. The public totals do **not** identify every solved problem. The workspace shows both the reported total and the count of locally verified problem identifiers when they differ. Previously saved accepted events are never erased by a short response or network failure.
 
-For more complete history, paste a `LEETCODE_SESSION` value in Settings or set it in `.env`. The local server stores a pasted cookie encrypted with a local key and never returns it to the browser. The optional history request retrieves pages of submissions incrementally, up to 4,000 events per sync. You can also import solved slugs from a JSON array, `{ "slugs": ["two-sum"] }`, or a CSV `slug` column. Imported slugs must already exist in the cached catalog. Manual **Solved** actions are verified locally and immediately leave the unsolved feed.
+For more complete history, paste a `LEETCODE_SESSION` value in Settings or set it in `.env`. The local server stores a pasted cookie encrypted with a local key and never returns it to the browser. The optional history request retrieves pages of submissions incrementally, up to 4,000 events per sync. A submission seen both publicly and through the session is stored once. You can also import solved slugs from a JSON array, `{ "slugs": ["two-sum"] }`, or a CSV `slug` column. Imported slugs must already exist in the cached catalog. Manual **Solved** actions are verified locally and immediately leave the unsolved feed.
 
-When hosted (`MULTI_USER=true`, enabled automatically on Vercel), every browser gets an anonymous `rl_uid` cookie and its own settings, LeetCode username, solves, skips, and session cookie. The problem catalog is shared. The server's `LEETCODE_SESSION` variable is ignored in this mode so visitors never use the owner's cookie. Locally, all data belongs to a single user, and an older single-user database is migrated in place on first start.
+Locally, all data belongs to a single user, and an older single-user database is migrated in place on first start. Because that data is private, the local server refuses requests addressed to any host other than `localhost`, `127.0.0.1`, or `[::1]`, so a tunnel or proxy cannot expose it to other people.
+
+When hosted (`MULTI_USER=true`, enabled automatically on Vercel), the server stores nothing per visitor. Each visitor's settings, LeetCode username, synced submissions, solves, and skips live in that visitor's own browser (`localStorage`). The browser sends its copy with each request, the server loads it for that request only, syncs that visitor's own LeetCode username, and returns the updated copy. This works on Vercel, where every function instance has its own temporary `/tmp` database. Visitors never see the owner's or each other's data, and clearing site data in a browser resets that visitor. Session cookies and catalog refresh are local-only features; the server's `LEETCODE_SESSION` variable is ignored when hosted.
+
+Hosted copies start from `server/db/catalogSnapshot.ts`, a bundled snapshot of public problem metadata. After refreshing the catalog locally, run `npm run catalog:snapshot` and redeploy to update it. The script opens the local database read-only and copies only the `problems` table.
 
 The SQLite file and session key live under `data/` by default. Set `DATABASE_PATH` to choose a different location. Do not publish `.env`, `data/`, or the session key.
 
@@ -35,10 +39,13 @@ The primary candidate query excludes accepted solves using the catalog's stable 
 web/src/                   React workspace, settings panel, API client, matte theme
 shared/types.ts            Shared TypeScript API and model types
 server/adapters/leetcode.ts Throttled GraphQL adapter
-server/db/index.ts         SQLite schema, migrations, persistence, account snapshots
+server/db/index.ts         SQLite schema, migrations, persistence, account snapshots, visitor state
+server/db/catalog*.ts      Bundled catalog snapshot and the loader that seeds an empty database
 server/engine/             Pure capability and ranking engine with tests
 server/routes/api.ts       Profile sync, catalog refresh, feedback, import/export, search
+server/app.ts              Express app: local host check and per-request hosted visitor state
 server/index.ts            Local Express entry point
+api/index.ts               Vercel function entry point
 ```
 
 The database migration adds account-scoped recommendation history and skips, with indexes. Existing `problems`, `submissions`, `ratings`, and account snapshots remain intact. The earlier dashboard, roadmap, plan navigation, chart dependency, and unused list/plan API routes were removed because the recommendation workspace presents the relevant progress and actions directly. Legacy saved lists remain in SQLite and in data export.

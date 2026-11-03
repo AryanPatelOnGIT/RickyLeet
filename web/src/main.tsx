@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { ExternalLink, RefreshCw, Search, Settings2, X } from 'lucide-react';
 import type { Difficulty, SearchFilters, SearchResponse, Settings } from '../../shared/types';
-import { api, bootstrap, saveSettings, search, searchCached, type Bootstrap } from './api';
+import { api, bootstrap, browserStorageFailed, saveSettings, search, searchCached, type Bootstrap } from './api';
 import './style.css';
 
 function parseImport(content: string, name: string): string[] {
@@ -35,6 +35,7 @@ function App() {
       setResults(value);
       setData(current => current ? { ...current, profile: value.profile, model: value.model, syncStatus: value.syncStatus, catalogCount: value.catalogCount } : current);
       if (value.syncError) setNotice(`LeetCode sync failed. Using saved data: ${value.syncError}`);
+      if (browserStorageFailed()) setNotice('This browser is blocking site storage, so your RickyLeet progress will be lost when this tab closes.');
     } catch (error) { setNotice(String(error)); }
     finally { setBusy(false); }
   }, []);
@@ -56,7 +57,7 @@ function App() {
     finally { setBusy(false); }
   };
   const feedback = async (slug: string, action: 'solved' | 'skipped') => {
-    try { await api('/feedback', 'POST', { slug, action }); await load(filters); setNotice(action === 'solved' ? 'Solve saved locally.' : 'Skipped for 30 days.'); }
+    try { await api('/feedback', 'POST', { slug, action }); await load(filters); setNotice(action === 'solved' ? data?.hosted ? 'Solve saved in this browser.' : 'Solve saved locally.' : 'Skipped for 30 days.'); }
     catch (error) { setNotice(String(error)); }
   };
   const save = async () => {
@@ -64,11 +65,19 @@ function App() {
     setBusy(true);
     try {
       const value = await saveSettings(draft); setDraft(value);
-      const fresh = await bootstrap(); setData(fresh);
-      await load(filters); setSettingsOpen(false);
+      const fresh = await bootstrap(); setData(fresh); setSettingsOpen(false);
       setNotice('Profile settings saved.');
+      // Pull the saved username's LeetCode data now instead of waiting for the next refresh.
+      await load(filters, true);
     } catch (error) { setNotice(String(error)); }
     finally { setBusy(false); }
+  };
+  const exportData = async () => {
+    try {
+      const url = URL.createObjectURL(new Blob([JSON.stringify(await api('/export', 'POST'), null, 2)], { type: 'application/json' }));
+      const link = document.createElement('a'); link.href = url; link.download = 'rickyleet-export.json'; link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) { setNotice(String(error)); }
   };
   const refreshCatalog = async () => {
     try {
@@ -97,7 +106,7 @@ function App() {
     <main className="workspace">
       {notice && <div className="notice" role="status">{notice}<button onClick={() => setNotice('')} aria-label="Dismiss"><X size={15}/></button></div>}
       <section className="summary" aria-label="Profile summary"><div><span className="label">PROFILE</span><strong>{profile.username || 'Add a username in Settings'}</strong></div><div><span className="label">VERIFIED SOLVES</span><strong>{status.verifiedSolved}</strong></div><div><span className="label">PRACTICE RANGE</span><strong>{practiceRange}</strong></div><div><span className="label">LAST SYNC</span><strong>{status.lastSync ? new Date(status.lastSync).toLocaleString() : 'Not yet synced'}</strong></div></section>
-      {incomplete && <p className="coverage" role="note">LeetCode reports {status.reportedSolved} solves; RickyLeet has identifiers for {status.verifiedSolved}. Public history may be incomplete. Add a session cookie or import solved slugs to improve exclusion.</p>}
+      {incomplete && <p className="coverage" role="note">LeetCode reports {status.reportedSolved} solves; RickyLeet has identifiers for {status.verifiedSolved}. Public history may be incomplete. {data.hosted ? 'Import solved slugs in Settings' : 'Add a session cookie or import solved slugs'} to improve exclusion.</p>}
       <section className="discovery"><div className="section-head"><div><span className="label">YOUR NEXT STEP</span><h2>Recommended problems</h2></div><button className="button primary" disabled={busy} onClick={() => void load(filters, true)}>{busy ? 'Updating…' : 'Refresh recommendations'}</button></div>
         <div className="controls"><label className="search-field"><Search size={17}/><input aria-label="Search problems" placeholder="Search title, ID, or topic" value={filters.query ?? ''} onChange={e => setFilters({ ...filters, query: e.target.value })} onKeyDown={e => { if (e.key === 'Enter') void load(filters); }}/></label><select aria-label="Topic filter" value={filters.tags?.[0] ?? ''} onChange={e => { const next = { ...filters, tags: e.target.value ? [e.target.value] : [] }; setFilters(next); void load(next); }}><option value="">All topics</option>{data.tags.map(tag => <option key={tag} value={tag}>{tag}</option>)}</select><select aria-label="Difficulty filter" value={filters.difficulties?.[0] ?? ''} onChange={e => { const next = { ...filters, difficulties: e.target.value ? [e.target.value as Difficulty] : [] }; setFilters(next); void load(next); }}><option value="">All difficulties</option>{(['Easy','Medium','Hard'] as Difficulty[]).map(difficulty => <option key={difficulty}>{difficulty}</option>)}</select><button className="button subtle" onClick={() => void load(filters)}>Apply</button></div>
         <div className="list-meta">{recommendations.length} unsolved suggestions from {data.catalogCount.toLocaleString()} cached problems</div>
@@ -105,7 +114,7 @@ function App() {
         {!recommendations.length && <div className="empty">{data.catalogCount ? 'No unsolved problems match these filters.' : 'Refresh the catalog in Settings to load problems.'}</div>}
       </section>
     </main>
-    {settingsOpen && draft && <div className="dialog-backdrop" onClick={() => setSettingsOpen(false)}><section className="settings-dialog" role="dialog" aria-modal="true" aria-label="Settings" onClick={e => e.stopPropagation()}><div className="dialog-head"><h2>Settings</h2><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={19}/></button></div><label>LeetCode username<input value={draft.username} onChange={e => setDraft({ ...draft, username: e.target.value })} placeholder="your-username"/></label><div className="setting-actions"><button className="button primary" disabled={busy} onClick={() => void save()}>Save profile</button><button className="button subtle" disabled={busy || !draft.username} onClick={() => void sync()}>Sync now</button></div><hr/><h3>Problem catalog</h3><p>Metadata is cached locally. A refresh may take several minutes.</p><button className="button subtle" onClick={() => void refreshCatalog()}>Refresh catalog</button><span className="setting-note">{catalogStatus}</span><hr/><h3>Complete solved history</h3><p>Public LeetCode data usually gives recent accepted submissions, not a complete solved list. You can import slugs or provide a session cookie.</p><label className="upload button subtle">Import solved JSON or CSV<input type="file" accept=".json,.csv,.txt" onChange={e => { const file = e.target.files?.[0]; if (file) void importFile(file); e.target.value = ''; }}/></label><p className="warning">Security: a LEETCODE_SESSION cookie grants account access. It is sent to this local server once, encrypted on disk, and sent only to LeetCode. Revoke it by logging out of LeetCode.</p><label>Session cookie<input type="password" autoComplete="off" value={session} onChange={e => setSession(e.target.value)} placeholder={draft.hasSession ? 'Saved locally' : 'Optional'}/></label><div className="setting-actions"><button className="button subtle" disabled={!session} onClick={() => void api('/session', 'POST', { session }).then(() => { setSession(''); setNotice('Session saved locally.'); })}>Save cookie</button><button className="button subtle" onClick={() => void api('/session', 'POST', { session: '' }).then(() => setNotice('Saved session cleared.'))}>Clear</button><a className="button subtle" href="/api/export" download>Export data</a></div></section></div>}
+    {settingsOpen && draft && <div className="dialog-backdrop" onClick={() => setSettingsOpen(false)}><section className="settings-dialog" role="dialog" aria-modal="true" aria-label="Settings" onClick={e => e.stopPropagation()}><div className="dialog-head"><h2>Settings</h2><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={19}/></button></div><label>LeetCode username<input value={draft.username} onChange={e => setDraft({ ...draft, username: e.target.value })} placeholder="your-username"/></label>{data.hosted && <p>Your username and progress are saved only in this browser. The server keeps nothing between requests, and other visitors never see your data.</p>}<div className="setting-actions"><button className="button primary" disabled={busy} onClick={() => void save()}>Save profile</button><button className="button subtle" disabled={busy || !draft.username} onClick={() => void sync()}>Sync now</button></div><hr/><h3>Problem catalog</h3>{data.hosted ? <p>This site includes a saved catalog of {data.catalogCount.toLocaleString()} problems.</p> : <><p>Metadata is cached locally. A refresh may take several minutes.</p><button className="button subtle" onClick={() => void refreshCatalog()}>Refresh catalog</button><span className="setting-note">{catalogStatus}</span></>}<hr/><h3>Complete solved history</h3><p>Public LeetCode data usually gives recent accepted submissions, not a complete solved list. {data.hosted ? 'You can import solved slugs or mark problems as Solved.' : 'You can import slugs or provide a session cookie.'}</p><label className="upload button subtle">Import solved JSON or CSV<input type="file" accept=".json,.csv,.txt" onChange={e => { const file = e.target.files?.[0]; if (file) void importFile(file); e.target.value = ''; }}/></label>{!data.hosted && <><p className="warning">Security: a LEETCODE_SESSION cookie grants account access. It is sent to this local server once, encrypted on disk, and sent only to LeetCode. Revoke it by logging out of LeetCode.</p><label>Session cookie<input type="password" autoComplete="off" value={session} onChange={e => setSession(e.target.value)} placeholder={draft.hasSession ? 'Saved locally' : 'Optional'}/></label></>}<div className="setting-actions">{!data.hosted && <><button className="button subtle" disabled={!session} onClick={() => void api('/session', 'POST', { session }).then(() => { setSession(''); setNotice('Session saved locally.'); }, error => setNotice(String(error)))}>Save cookie</button><button className="button subtle" onClick={() => void api('/session', 'POST', { session: '' }).then(() => setNotice('Saved session cleared.'), error => setNotice(String(error)))}>Clear</button></>}<button className="button subtle" onClick={() => void exportData()}>Export data</button></div></section></div>}
   </div>;
 }
 

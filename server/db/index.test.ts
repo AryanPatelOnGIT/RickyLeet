@@ -7,6 +7,7 @@ import type { Problem, Submission } from '../../shared/types.js';
 const folder = mkdtempSync(join(tmpdir(), 'rickyleet-test-'));
 process.env.DATABASE_PATH = join(folder, 'test.sqlite');
 const store = await import('./index.js');
+const { runAsOwner } = await import('../context.js');
 const sample: Problem = { id: '1', slug: 'two-sum', title: 'Two Sum', difficulty: 'Easy', acceptance: 55, tags: ['Array'], paid: false, likes: 100, dislikes: 5 };
 const accepted: Submission = { id: 'public:1', slug: sample.slug, timestamp: 1_700_000_000_000, status: 'accepted', attempts: 1, source: 'public' };
 
@@ -44,6 +45,31 @@ describe('SQLite progress', () => {
     expect(store.getSkipped('alice').size).toBe(0);
     expect(store.getSkipped('bob').has('two-sum')).toBe(true);
     expect(store.getRecommendationHistory('bob').has('array-next')).toBe(true);
+  });
+  it('keeps one copy of a submission reported publicly and through a session', () => {
+    runAsOwner('dedupe', () => {
+      store.saveSubmissions([{ ...accepted, id: 'public:77' }, { ...accepted, id: 'session:77', attempts: 3, source: 'session' }, { ...accepted, id: 'public:77' }]);
+      expect(store.getSubmissions().map(s => [s.id, s.attempts])).toEqual([['session:77', 3]]);
+    });
+  });
+  it('round-trips a visitor\'s data and leaves nothing behind', () => {
+    const state = runAsOwner('visitor:a', () => {
+      store.setKV('settings', { ...store.getSettings(), username: 'carol' });
+      store.saveSubmissions([accepted]);
+      store.skipRecommendation('carol', 'array-next');
+      const saved = store.exportVisitorState();
+      store.deleteVisitorState();
+      expect(store.getSubmissions()).toEqual([]);
+      return saved;
+    });
+    runAsOwner('visitor:b', () => {
+      store.importVisitorState(JSON.parse(JSON.stringify(state)));
+      expect(store.getSettings().username).toBe('carol');
+      expect(store.getVerifiedSolved()).toEqual(new Set(['two-sum']));
+      expect(store.getSkipped('carol').has('array-next')).toBe(true);
+      store.deleteVisitorState();
+    });
+    expect(store.db.prepare("SELECT COUNT(*) AS n FROM kv WHERE key LIKE 'u:visitor:%'").get()).toEqual({ n: 0 });
   });
   it('preserves progress after reopening SQLite', async () => {
     const before = store.getVerifiedSolved();
